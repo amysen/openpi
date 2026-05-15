@@ -855,6 +855,106 @@ _CONFIGS = [
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
     ),
+    # LoRA fine-tune of pi05_libero on the local CompoSuite box+no-obstacle pilot
+    # dataset (sanity-run; see docs/phase_2e_2f_report.md). Single 24GB GPU friendly.
+    TrainConfig(
+        name="pi05_libero_composuite_box_pilot",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="composuite_box_objective_v1",
+            assets=AssetsConfig(
+                assets_dir="/home/amy/.cache/openpi/openpi-assets/checkpoints/pi05_libero/assets",
+                asset_id="physical-intelligence/libero",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=2.5e-5,
+            decay_steps=2_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/amy/.cache/openpi/openpi-assets/checkpoints/pi05_libero/params"
+        ),
+        num_train_steps=2_000,
+        save_interval=500,
+        log_interval=10,
+        keep_period=None,
+        specific_checkpoints_to_keep=[],
+        save_train_state=False,
+        wandb_enabled=False,
+        checkpoint_base_dir="/home/amy/Projects/openpi/checkpoints",
+        assets_base_dir="/home/amy/Projects/openpi/assets",
+    ),
+    # LoRA fine-tune for CompoSuite transfer tasks in the LIBERO pipeline.
+    # For the initial plate-transfer sanity run, copy the LeRobot dataset to
+    # $HF_LEROBOT_HOME/composuite_plate_transfer_sanity before running
+    # compute_norm_stats.py / train.py on a cluster machine.
+    TrainConfig(
+        name="pi05_libero_composuite_transfer",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="composuite_plate_transfer_sanity",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_libero/assets",
+                asset_id="physical-intelligence/libero",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=25,
+            peak_lr=2.5e-5,
+            decay_steps=500,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_libero/params"
+        ),
+        num_train_steps=500,
+        save_interval=100,
+        log_interval=10,
+        keep_period=None,
+        specific_checkpoints_to_keep=[],
+        save_train_state=False,
+        wandb_enabled=False,
+        checkpoint_base_dir="checkpoints",
+        assets_base_dir="assets",
+    ),
     #
     # Fine-tuning Aloha configs.
     #
