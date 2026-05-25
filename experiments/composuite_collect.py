@@ -85,7 +85,7 @@ def _quat2axisangle(quat):
     return (quat[:3] * 2.0 * math.acos(quat[3])) / den
 
 
-def _make_env(robot, object_type, obstacle, objective, seed):
+def _make_env(robot, object_type, obstacle, objective, seed, use_composuite_agentview=False):
     cfg = load_controller_config(default_controller="OSC_POSE")
     env = CompoSuiteEnv(
         robot=robot,
@@ -98,6 +98,7 @@ def _make_env(robot, object_type, obstacle, objective, seed):
         camera_widths=RES,
         horizon=800,
         ignore_done=True,
+        use_composuite_agentview=use_composuite_agentview,
     )
     env.seed(seed)
     return env
@@ -131,8 +132,12 @@ def _state8(obs):
 
 def _frames(obs):
     # Flip rendering convention to match how composuite_smoke feeds the policy.
-    img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
-    wrist = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+    # Match LIBERO's image convention: vertical flip ONLY (not double flip).
+    # Mujoco renders with +y down in the image; one [::-1] makes it right-side
+    # up. Applying [::-1, ::-1] would 180-rotate the image and produce a
+    # horizontally-mirrored framing vs the pi05_libero training data.
+    img = np.ascontiguousarray(obs["agentview_image"][::-1])
+    wrist = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1])
     return img, wrist
 
 
@@ -771,6 +776,10 @@ def main():
     p.add_argument("--max-steps", type=int, default=300)
     p.add_argument("--out-dir", default="data/composuite/pilot")
     p.add_argument("--seed", type=int, default=11)
+    p.add_argument("--use-composuite-agentview", action="store_true",
+                   help="Use CompoSuite's pulled-back agentview (pos=[0.74,0,1.72], fovy=52). "
+                        "Default is the LIBERO scene-XML camera (pos=[0.5,0,1.35], default fovy) "
+                        "so demos match the framing pi05_libero was trained on.")
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -785,7 +794,8 @@ def main():
         prompt = _generate_language(robot, obj, obstacle, objective)
         logging.info(f"=== {task_name} | prompt={prompt!r} ===")
 
-        env = _make_env(robot, obj, obstacle, objective, args.seed)
+        env = _make_env(robot, obj, obstacle, objective, args.seed,
+                        use_composuite_agentview=args.use_composuite_agentview)
         n_succ = 0
         attempts = 0
         for attempt in range(args.max_attempts_per_task):

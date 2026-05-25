@@ -908,6 +908,12 @@ _CONFIGS = [
     # For the initial plate-transfer sanity run, copy the LeRobot dataset to
     # $HF_LEROBOT_HOME/composuite_plate_transfer_sanity before running
     # compute_norm_stats.py / train.py on a cluster machine.
+    # Norm stats: this config loads stats freshly computed on the local CompoSuite
+    # dataset from <assets_base_dir>/<name>/<asset_id>/norm_stats.json — i.e.
+    # assets/pi05_libero_composuite_transfer/composuite_plate_transfer_sanity/.
+    # Do NOT reuse the bundled LIBERO stats: action distribution is heavily
+    # asymmetric in scripted CompoSuite demos, and eef_z / wrist axis-angle live
+    # near or past the LIBERO q01/q99 envelope (side-grasp is OOD for LIBERO).
     TrainConfig(
         name="pi05_libero_composuite_transfer",
         model=pi0_config.Pi0Config(
@@ -920,21 +926,25 @@ _CONFIGS = [
         data=LeRobotLiberoDataConfig(
             repo_id="composuite_plate_transfer_sanity",
             assets=AssetsConfig(
-                assets_dir="gs://openpi-assets/checkpoints/pi05_libero/assets",
-                asset_id="physical-intelligence/libero",
+                asset_id="composuite_plate_transfer_sanity",
             ),
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),
-        batch_size=16,
+        # LR schedule, EMA, and step count mirror the pi05_libero reference
+        # config. batch_size is set to 32 as a reasonable single-large-GPU
+        # default (the reference uses 256 across multiple GPUs); bump it up
+        # on a single 80 GB+ card or shard with fsdp_devices on multi-GPU.
+        # Drop to 8 with ema_decay=None if running on 24 GB.
+        batch_size=32,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=25,
-            peak_lr=2.5e-5,
-            decay_steps=500,
-            decay_lr=2.5e-6,
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=None,
+        ema_decay=0.999,
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
             action_horizon=10,
@@ -945,13 +955,13 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi05_libero/params"
         ),
-        num_train_steps=500,
-        save_interval=100,
+        num_train_steps=30_000,
+        save_interval=1_000,
         log_interval=10,
         keep_period=None,
         specific_checkpoints_to_keep=[],
         save_train_state=False,
-        wandb_enabled=False,
+        wandb_enabled=True,
         checkpoint_base_dir="checkpoints",
         assets_base_dir="assets",
     ),
