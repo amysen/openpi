@@ -211,6 +211,72 @@ class GaussianBlurImages(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class StateGaussianNoise(DataTransformFn):
+    """Add Gaussian noise to one state key per sample.
+
+    Used to robustify behaviour cloning against closed-loop covariate shift:
+    perturbing training states slightly teaches the policy to predict the same
+    action from off-trajectory neighbours. Only meaningful inside the repack
+    group, which runs during dataset iteration but not at inference.
+    """
+
+    sigma: float = 0.005
+    state_key: str = "observation/state"
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if self.state_key not in data or self.sigma <= 0.0:
+            return data
+        s = np.asarray(data[self.state_key], dtype=np.float32)
+        noise = np.random.normal(0.0, self.sigma, size=s.shape).astype(np.float32)
+        out = dict(data)
+        out[self.state_key] = s + noise
+        return out
+
+
+@dataclasses.dataclass(frozen=True)
+class ImageColorJitter(DataTransformFn):
+    """Apply uniform-random brightness / contrast / saturation jitter to a set
+    of image keys. Each factor is sampled as 1 + Uniform(-amount, +amount),
+    applied independently per image key per sample.
+
+    Same purpose as StateGaussianNoise — robustify against minor visual variation
+    the closed-loop policy will encounter. Only valid inside the repack group
+    (the data the eval pipeline sees must be deterministic).
+    """
+
+    brightness: float = 0.0
+    contrast: float = 0.0
+    saturation: float = 0.0
+    image_keys: tuple[str, ...] = ("observation/image", "observation/wrist_image")
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if max(self.brightness, self.contrast, self.saturation) <= 0.0:
+            return data
+        out = dict(data)
+        for key in self.image_keys:
+            if key not in out:
+                continue
+            img = np.asarray(out[key])
+            if img.dtype != np.uint8:
+                # LeRobot can return float32 in [0,1] depending on cast
+                if np.issubdtype(img.dtype, np.floating) and img.max() <= 1.0001:
+                    img = np.clip(img * 255.0, 0, 255).astype(np.uint8)
+                else:
+                    img = np.clip(img, 0, 255).astype(np.uint8)
+            x = img.astype(np.float32)
+            if self.brightness > 0.0:
+                x = x * (1.0 + np.random.uniform(-self.brightness, self.brightness))
+            if self.contrast > 0.0:
+                mean = x.mean()
+                x = (x - mean) * (1.0 + np.random.uniform(-self.contrast, self.contrast)) + mean
+            if self.saturation > 0.0:
+                gray = x.mean(axis=-1, keepdims=True)
+                x = (x - gray) * (1.0 + np.random.uniform(-self.saturation, self.saturation)) + gray
+            out[key] = np.clip(x, 0, 255).astype(np.uint8)
+        return out
+
+
+@dataclasses.dataclass(frozen=True)
 class SubsampleActions(DataTransformFn):
     stride: int
 

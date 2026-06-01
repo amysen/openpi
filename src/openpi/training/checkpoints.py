@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures as futures
 import dataclasses
 import logging
+from typing import TYPE_CHECKING
 from typing import Protocol
 
 from etils import epath
@@ -13,8 +14,10 @@ import orbax.checkpoint.future as future
 
 from openpi.shared import array_typing as at
 import openpi.shared.normalize as _normalize
-import openpi.training.data_loader as _data_loader
 import openpi.training.utils as training_utils
+
+if TYPE_CHECKING:
+    import openpi.training.data_loader as _data_loader
 
 
 class DualCheckpointManager:
@@ -29,6 +32,8 @@ class DualCheckpointManager:
     def save(self, step: int, items: dict):
         for mng in self.mngs:
             items_single = {k: v for k, v in items.items() if self.mng_assignments[k] == mng}
+            if not items_single:
+                continue
             mng.save(step, items_single)
     
     def restore(self, step: int, items: dict):

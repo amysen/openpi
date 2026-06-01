@@ -340,6 +340,39 @@ def create_torch_data_loader(
     else:
         local_batch_size = batch_size // jax.process_count()
 
+    # Optional phase-weighted sampler. Skipped under DDP (DistributedSampler already set)
+    # and under fake/RLDS data. Replaces uniform shuffling with motion-magnitude
+    # weighting so grasp/place frames are not drowned out by long approach phases.
+    if (
+        sampler is None
+        and data_config.phase_weighted_sampling
+        and data_config.repo_id not in (None, "fake")
+        and data_config.rlds_data_dir is None
+    ):
+        weights = _build_phase_weights(
+            dataset,
+            baseline=data_config.phase_weight_baseline,
+            alpha=data_config.phase_weight_alpha,
+        )
+        generator = torch.Generator()
+        generator.manual_seed(int(seed))
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights=weights,
+            num_samples=len(weights),
+            replacement=True,
+            generator=generator,
+        )
+        logging.info(
+            "phase_weighted_sampling: enabled (baseline=%.3f, alpha=%.3f, n=%d, "
+            "weight stats min=%.3f mean=%.3f max=%.3f)",
+            data_config.phase_weight_baseline,
+            data_config.phase_weight_alpha,
+            len(weights),
+            float(weights.min()),
+            float(weights.mean()),
+            float(weights.max()),
+        )
+
     logging.info(f"local_batch_size: {local_batch_size}")
     data_loader = TorchDataLoader(
         dataset,
@@ -354,6 +387,39 @@ def create_torch_data_loader(
     )
 
     return DataLoaderImpl(data_config, data_loader)
+
+
+def _build_phase_weights(dataset, *, baseline: float, alpha: float) -> torch.Tensor:
+    """Build per-frame sampling weights from the underlying LeRobotDataset actions.
+
+    weight[t] = baseline + alpha * min(1, ||actions[t]|| / scale)
+
+    where scale is the p90 of action norms across the dataset. This upweights
+    high-motion frames (grasp, place) relative to slow approach frames without
+    starving any frame entirely.
+    """
+    base = dataset
+    while hasattr(base, "_dataset"):
+        base = base._dataset
+    hf_dataset = getattr(base, "hf_dataset", None)
+    if hf_dataset is None:
+        raise RuntimeError(
+            "phase_weighted_sampling requires the dataset to expose an underlying "
+            "LeRobotDataset with an `hf_dataset` attribute."
+        )
+    actions_col = hf_dataset["actions"]
+    actions = np.asarray(actions_col, dtype=np.float32)
+    if actions.ndim != 2:
+        actions = actions.reshape(actions.shape[0], -1)
+    # Use the translation/joint part for magnitude, not the last (gripper command)
+    # dim, which is typically a discrete +/-1 and would dominate the norm.
+    motion = actions[:, :-1] if actions.shape[1] > 1 else actions
+    norms = np.linalg.norm(motion, axis=1)
+    scale = float(np.quantile(norms, 0.9))
+    if scale <= 0:
+        scale = float(norms.max()) or 1.0
+    weights = baseline + alpha * np.minimum(1.0, norms / scale)
+    return torch.as_tensor(weights, dtype=torch.double)
 
 
 def create_rlds_data_loader(

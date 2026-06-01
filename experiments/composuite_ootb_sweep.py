@@ -140,6 +140,15 @@ def task_specs(preset_name):
     return specs
 
 
+def read_task_specs(path):
+    specs = []
+    for line in pathlib.Path(path).read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            specs.append(line)
+    return specs
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--preset", choices=sorted(PRESETS), default="core16")
@@ -152,6 +161,21 @@ def main():
     parser.add_argument("--replan-steps", type=int, default=5)
     parser.add_argument("--out-root", default="data/composuite/ootb")
     parser.add_argument(
+        "--task-specs-file",
+        default=None,
+        help="Optional newline-delimited task spec file for running a subset of the preset.",
+    )
+    parser.add_argument(
+        "--results-jsonl",
+        default=None,
+        help="Optional results JSONL path. Defaults to results.jsonl under the run directory.",
+    )
+    parser.add_argument(
+        "--worker-id",
+        default=None,
+        help="Optional worker label used to avoid command/task file collisions.",
+    )
+    parser.add_argument(
         "--python",
         default=sys.executable,
         help="Python executable for composuite_smoke.py. Use the libero conda env when running the simulator client.",
@@ -162,10 +186,17 @@ def main():
     run_name = f"{args.model_id}_{args.preset}_n{args.trials}_seed{args.seed}"
     out_root = pathlib.Path(args.out_root) / run_name
     video_dir = out_root / "videos"
-    results_jsonl = out_root / "results.jsonl"
+    if args.results_jsonl:
+        results_jsonl = pathlib.Path(args.results_jsonl)
+    elif args.worker_id is not None:
+        results_jsonl = out_root / f"results_worker_{args.worker_id}.jsonl"
+    else:
+        results_jsonl = out_root / "results.jsonl"
     out_root.mkdir(parents=True, exist_ok=True)
 
-    specs = task_specs(args.preset)
+    specs = read_task_specs(args.task_specs_file) if args.task_specs_file else task_specs(args.preset)
+    if not specs:
+        raise SystemExit("No task specs to run")
     print(f"Preset: {args.preset}")
     print(f"Tasks: {len(specs)}")
     print(f"Trials per task: {args.trials}")
@@ -195,8 +226,9 @@ def main():
         str(args.seed),
     ]
 
-    (out_root / "command.txt").write_text(" ".join(cmd) + "\n")
-    (out_root / "task_specs.txt").write_text("\n".join(specs) + "\n")
+    file_suffix = f"_worker_{args.worker_id}" if args.worker_id is not None else ""
+    (out_root / f"command{file_suffix}.txt").write_text(" ".join(cmd) + "\n")
+    (out_root / f"task_specs{file_suffix}.txt").write_text("\n".join(specs) + "\n")
 
     if args.dry_run:
         print(" ".join(cmd))

@@ -27,7 +27,8 @@ from libero.libero.envs.composuite import CompoSuiteEnv
 from robosuite.controllers import load_controller_config
 
 
-LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
+OSC_POSE_DUMMY_ACTION = [0.0] * 6 + [-1.0]
+JOINT_POSITION_DUMMY_ACTION = [0.0] * 7 + [-1.0]
 RES = 256
 PRIMARY_TARGET_COLORS = ("red", "blue", "green")
 
@@ -53,8 +54,27 @@ def _quat2axisangle(quat):
     return (quat[:3] * 2.0 * math.acos(quat[3])) / den
 
 
-def _make_env(robot, object_type, obstacle, objective, seed, clutter="none", target_color="red"):
-    cfg = load_controller_config(default_controller="OSC_POSE")
+def _make_env(
+    robot,
+    object_type,
+    obstacle,
+    objective,
+    seed,
+    clutter="none",
+    target_color="red",
+    controller="OSC_POSE",
+):
+    cfg = load_controller_config(default_controller=controller)
+    env_kwargs = {}
+    if controller == "JOINT_POSITION":
+        # Match the collector/replay environment used for the trainable plate
+        # demos. The robosuite default JOINT_POSITION controller is slower and
+        # CompoSuite's default horizon terminates before the plate demos reach
+        # the grasp/close phase.
+        cfg["output_max"] = 0.12
+        cfg["output_min"] = -0.12
+        cfg["kp"] = 150
+        env_kwargs.update(horizon=1400, ignore_done=True)
     env = CompoSuiteEnv(
         robot=robot,
         object_type=object_type,
@@ -66,6 +86,7 @@ def _make_env(robot, object_type, obstacle, objective, seed, clutter="none", tar
         camera_names=["agentview", "robot0_eye_in_hand"],
         camera_heights=RES,
         camera_widths=RES,
+        **env_kwargs,
     )
     env.seed(seed)
     return env
@@ -102,16 +123,20 @@ def _generate_language(robot, obj, obstacle, objective, clutter="none", target_c
 
 def run_episode(env, client, prompt, args):
     env.reset()
-    obs, _, _, _ = env.step(LIBERO_DUMMY_ACTION)
+    dummy_action = JOINT_POSITION_DUMMY_ACTION if args.controller == "JOINT_POSITION" else OSC_POSE_DUMMY_ACTION
+    obs, _, _, _ = env.step(dummy_action)
+    start_object_pos = np.array(obs.get("object_pos", np.zeros(3)), dtype=np.float32)
     action_plan = collections.deque()
     replay_images = []
+    executed_actions = []
     cum_reward = 0.0
-    done = False
+    env_done = False
+    last_info = {}
     t = 0
     while t < args.max_steps + args.num_steps_wait:
         try:
             if t < args.num_steps_wait:
-                obs, _, done, _ = env.step(LIBERO_DUMMY_ACTION)
+                obs, _, env_done, last_info = env.step(dummy_action)
                 t += 1
                 continue
             img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
@@ -135,27 +160,54 @@ def run_episode(env, client, prompt, args):
                     ),
                     "prompt": str(prompt),
                 }
-                action_chunk = client.infer(element)["actions"]
-                action_plan.extend(action_chunk[: args.replan_steps])
-            action = action_plan.popleft()
-            obs, reward, done, info = env.step(action.tolist())
+            action_chunk = client.infer(element)["actions"]
+            action_plan.extend(action_chunk[: args.replan_steps])
+            action = np.asarray(action_plan.popleft(), dtype=np.float32)
+            if args.controller == "JOINT_POSITION":
+                action = action[:8]
+            else:
+                action = action[:7]
+            executed_actions.append(action)
+            obs, reward, env_done, last_info = env.step(action.tolist())
             cum_reward += float(reward)
-            if done:
+            if env_done:
                 break
             t += 1
         except Exception as e:
             logging.exception(f"step error: {e}")
             break
     diag = {}
+    strict_success = False
     try:
+        object_pos = np.array(obs.get("object_pos", np.zeros(3)), dtype=np.float32)
+        goal_pos = np.array(obs.get("goal_pos", np.zeros(3)), dtype=np.float32)
+        object_to_goal = float(np.linalg.norm(object_pos - goal_pos))
+        object_displacement = float(np.linalg.norm(object_pos - start_object_pos))
+        strict_success = bool(env._check_success())
+        action_diag = {}
+        if executed_actions:
+            action_arr = np.stack(executed_actions, axis=0)
+            gripper_idx = action_arr.shape[1] - 1
+            action_diag = {
+                "action_mean": action_arr.mean(axis=0).round(4).tolist(),
+                "action_std": action_arr.std(axis=0).round(4).tolist(),
+                "action_min": action_arr.min(axis=0).round(4).tolist(),
+                "action_max": action_arr.max(axis=0).round(4).tolist(),
+                "gripper_close_frac": float(np.mean(action_arr[:, gripper_idx] > 0.0)),
+            }
         diag = {
-            "obj_to_goal": float(np.linalg.norm(obs.get("object_to_goal_pos", np.zeros(3)))),
+            "obj_to_goal": object_to_goal,
             "obj_to_eef": float(np.linalg.norm(obs.get("object_to_eef_pos", np.zeros(3)))),
             "obj_z": float(obs.get("object_pos", np.zeros(3))[2]),
+            "object_displacement": object_displacement,
+            "env_done": bool(env_done),
+            "env_info_success": bool(last_info.get("success", False)),
+            "strict_success": bool(strict_success),
+            **action_diag,
         }
     except Exception:
         pass
-    return done, t, cum_reward, replay_images, diag
+    return strict_success, t, cum_reward, replay_images, diag
 
 
 def main():
@@ -174,9 +226,18 @@ def main():
     p.add_argument("--num-steps-wait", type=int, default=10)
     p.add_argument("--replan-steps", type=int, default=5)
     p.add_argument("--resize-size", type=int, default=224)
+    p.add_argument("--controller", default="OSC_POSE", choices=["OSC_POSE", "JOINT_POSITION"])
     p.add_argument("--video-out-path", default="data/composuite/videos")
     p.add_argument("--results-jsonl", default=None)
     p.add_argument("--seed", type=int, default=7)
+    p.add_argument(
+        "--env-seed",
+        type=int,
+        default=None,
+        help="If set, use this as the per-task base env seed directly (skipping "
+             "the _stable_seed hash of --seed). Per-trial seeds become "
+             "env_seed + ep. Use to align eval initial states with collection seeds.",
+    )
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -214,7 +275,10 @@ def main():
     t0_total = time.time()
     for (robot, obj, obstacle, objective, clutter) in tasks:
         target_color = _target_color_for_seed(args.seed)
-        task_seed = _stable_seed(args.seed, robot, obj, obstacle, objective, clutter)
+        if args.env_seed is not None:
+            task_seed = int(args.env_seed)
+        else:
+            task_seed = _stable_seed(args.seed, robot, obj, obstacle, objective, clutter)
         gen_lang = _generate_language(
             robot, obj, obstacle, objective, clutter, target_color
         )
@@ -233,14 +297,15 @@ def main():
             args.seed,
             clutter=clutter,
             target_color=target_color,
+            controller=args.controller,
         )
         for ep in range(args.num_trials_per_task):
             episode_seed = task_seed + ep
             env.seed(episode_seed)
             t0 = time.time()
-            done, steps, ret, frames, diag = run_episode(env, client, prompt, args)
+            success, steps, ret, frames, diag = run_episode(env, client, prompt, args)
             dt = time.time() - t0
-            suffix = "success" if done else "failure"
+            suffix = "success" if success else "failure"
             vp = pathlib.Path(args.video_out_path) / f"rollout_{name}_ep{ep}_{suffix}.mp4"
             if frames:
                 imageio.mimwrite(vp, [np.asarray(x) for x in frames], fps=10)
@@ -250,12 +315,12 @@ def main():
                 "target_color": target_color,
                 "prompt": prompt, "generated_language": gen_lang,
                 "episode": ep, "seed": int(episode_seed),
-                "success": bool(done), "steps": int(steps),
+                "success": bool(success), "steps": int(steps),
                 "return": ret, "wall_seconds": round(dt, 1),
                 "diag": diag, "video": str(vp),
             }
             results.append(rec)
-            logging.info(f"  ep{ep}: success={done} steps={steps} return={ret:.2f} time={dt:.1f}s diag={diag}")
+            logging.info(f"  ep{ep}: success={success} steps={steps} return={ret:.2f} time={dt:.1f}s diag={diag}")
             if args.results_jsonl:
                 with open(args.results_jsonl, "a") as f:
                     f.write(json.dumps(rec) + "\n")

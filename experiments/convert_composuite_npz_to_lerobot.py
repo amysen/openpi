@@ -13,7 +13,7 @@ Each input NPZ contains:
   image:       (T, 256, 256, 3) uint8
   wrist_image: (T, 256, 256, 3) uint8
   state:       (T, 8)           float32  [eef_pos(3), axisangle(3), gripper_qpos[:2]]
-  actions:     (T, 7)           float32  OSC_POSE deltas + gripper
+  actions:     (T, A)           float32  controller actions + gripper
   task:        scalar str       language prompt
 
 Output dataset is written to $HF_LEROBOT_HOME/<repo_id>/.
@@ -41,12 +41,39 @@ def main():
                    help="Delete the output directory if it already exists")
     p.add_argument("--image-writer-threads", type=int, default=8)
     p.add_argument("--image-writer-processes", type=int, default=8)
+    p.add_argument("--start-idx", type=int, default=0,
+                   help="Index of first episode to process (inclusive). Use with --end-idx for shard-parallel conversion.")
+    p.add_argument("--end-idx", type=int, default=None,
+                   help="Index past the last episode to process (exclusive). Defaults to all episodes.")
+    p.add_argument(
+        "--trim-leading-idle",
+        action="store_true",
+        help="Drop the leading frames of each episode where the EE is essentially static "
+             "(see --idle-action-thresh / --idle-min-run / --idle-max-trim).",
+    )
+    p.add_argument(
+        "--idle-action-thresh", type=float, default=5e-3,
+        help="Per-frame action-xyz norm below this counts as idle (OSC_POSE delta units).",
+    )
+    p.add_argument(
+        "--idle-min-run", type=int, default=10,
+        help="Minimum consecutive idle frames at the start before trimming kicks in.",
+    )
+    p.add_argument(
+        "--idle-max-trim-frac", type=float, default=0.5,
+        help="Never trim more than this fraction of the episode length.",
+    )
     args = p.parse_args()
 
     ep_dir = pathlib.Path(args.episodes_dir)
     npz_paths = sorted(ep_dir.glob("*.npz"))
     if not npz_paths:
         raise SystemExit(f"No .npz files in {ep_dir}")
+    end_idx = args.end_idx if args.end_idx is not None else len(npz_paths)
+    npz_paths = npz_paths[args.start_idx:end_idx]
+    if not npz_paths:
+        raise SystemExit(f"No episodes in slice [{args.start_idx}:{end_idx}] (total {len(sorted(ep_dir.glob('*.npz')))}).")
+    print(f"Processing episodes [{args.start_idx}:{end_idx}] ({len(npz_paths)} episodes)")
 
     out_path = HF_LEROBOT_HOME / args.repo_id
     if out_path.exists():
@@ -56,6 +83,17 @@ def main():
         shutil.rmtree(out_path)
 
     print(f"Creating LeRobotDataset at {out_path}")
+    with np.load(npz_paths[0], allow_pickle=True) as first_ep:
+        action_dim = int(first_ep["actions"].shape[-1])
+    for pth in npz_paths[1:]:
+        with np.load(pth, allow_pickle=True) as d:
+            this_dim = int(d["actions"].shape[-1])
+        if this_dim != action_dim:
+            raise SystemExit(
+                f"Mixed action dimensions are not supported: {npz_paths[0].name} has {action_dim}, "
+                f"{pth.name} has {this_dim}. Keep OSC_POSE and IK_POSE demos in separate datasets."
+            )
+    print(f"  action_dim={action_dim}", flush=True)
     dataset = LeRobotDataset.create(
         repo_id=args.repo_id,
         robot_type=args.robot_type,
@@ -78,7 +116,7 @@ def main():
             },
             "actions": {
                 "dtype": "float32",
-                "shape": (7,),
+                "shape": (action_dim,),
                 "names": ["actions"],
             },
         },
@@ -107,6 +145,24 @@ def main():
         wrist_images = d["wrist_image"]
         states = d["state"].astype(np.float32, copy=False)
         actions = d["actions"].astype(np.float32, copy=False)
+        T = states.shape[0]
+        start_idx = 0
+        if args.trim_leading_idle and T > args.idle_min_run + 1:
+            xyz_norm = np.linalg.norm(actions[:, :3], axis=1)
+            idle = xyz_norm < args.idle_action_thresh
+            run = 0
+            for t in range(T):
+                if idle[t]:
+                    run += 1
+                else:
+                    break
+            if run >= args.idle_min_run:
+                max_trim = int(T * args.idle_max_trim_frac)
+                start_idx = min(run, max_trim)
+        images = images[start_idx:]
+        wrist_images = wrist_images[start_idx:]
+        states = states[start_idx:]
+        actions = actions[start_idx:]
         T = states.shape[0]
         # task may be a 0-d numpy array of dtype object/str
         task_arr = d["task"]
