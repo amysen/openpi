@@ -1,7 +1,11 @@
 import dataclasses
 import functools
 import logging
+import os
+import pathlib
 import platform
+import subprocess
+import sys
 from typing import Any
 
 import etils.epath as epath
@@ -270,6 +274,64 @@ def main(config: _config.TrainConfig):
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1 or step in config.specific_checkpoints_to_keep:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step, save_train_state=config.save_train_state)
+            # Optional post-save eval hook. If OPENPI_EVAL_AFTER_SAVE is set to
+            # a path to a Python script, run it as a blocking subprocess so it
+            # has exclusive GPU access (LoRA training + pi05 inference together
+            # don't fit on a single 24 GB card). The subprocess receives:
+            #   --config-name <config.name>
+            #   --checkpoint-dir <ckpt_dir>/<step>
+            #   --out-dir       <ckpt_dir>/eval_videos
+            # plus any extra args from OPENPI_EVAL_AFTER_SAVE_ARGS (space-split).
+            eval_script = os.environ.get("OPENPI_EVAL_AFTER_SAVE")
+            if eval_script:
+                # Block on the (otherwise async) orbax write so the eval
+                # subprocess reads a complete checkpoint.
+                checkpoint_manager.wait_until_finished()
+                ckpt_step_dir = config.checkpoint_dir / str(step)
+                out_dir = config.checkpoint_dir / "eval_videos"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                cmd = [
+                    sys.executable, eval_script,
+                    "--config-name", config.name,
+                    "--checkpoint-dir", str(ckpt_step_dir),
+                    "--out-dir", str(out_dir),
+                ]
+                extra = os.environ.get("OPENPI_EVAL_AFTER_SAVE_ARGS", "").split()
+                cmd.extend(extra)
+                logging.info(f"Running post-save eval: {' '.join(cmd)}")
+                try:
+                    subprocess.run(cmd, check=False)
+                except Exception as e:
+                    logging.warning(f"post-save eval subprocess failed: {e}")
+                # Read eval JSON the subprocess wrote and forward
+                # success_rate + sample videos to the active wandb run so
+                # they show up next to the train loss.
+                try:
+                    eval_json = out_dir / f"step_{step}_eval.json"
+                    if eval_json.exists():
+                        import json as _json
+                        with open(eval_json) as f:
+                            summary = _json.load(f)
+                        log_payload: dict[str, Any] = {
+                            "eval/success_rate": float(summary.get("success_rate", 0.0)),
+                            "eval/num_trials": int(summary.get("num_trials", 0)),
+                        }
+                        trials = summary.get("trials") or []
+                        steps_taken = [t.get("steps", 0) for t in trials]
+                        if steps_taken:
+                            log_payload["eval/avg_steps"] = float(np.mean(steps_taken))
+                        for trial in trials:
+                            vp = trial.get("video")
+                            if vp and pathlib.Path(vp).exists():
+                                log_payload[f"eval/video_trial{trial.get('trial', 0):02d}"] = wandb.Video(
+                                    vp, fps=20, format="mp4"
+                                )
+                        wandb.log(log_payload, step=step)
+                        logging.info(
+                            f"Logged eval success_rate={log_payload['eval/success_rate']:.2f} to wandb at step {step}"
+                        )
+                except Exception as e:
+                    logging.warning(f"failed to forward eval results to wandb: {e}")
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
