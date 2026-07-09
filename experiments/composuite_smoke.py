@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import pathlib
 import time
 
@@ -86,6 +87,12 @@ def _make_env(
         camera_names=["agentview", "robot0_eye_in_hand"],
         camera_heights=RES,
         camera_widths=RES,
+        # Match the pi05_libero training POV (and the plate fine-tuning demos in
+        # composuite_collect.py / eval_plate.py). CompoSuiteEnv defaults this to
+        # True = the pulled-back composuite agentview (pos=[0.74,0,1.72], fovy=52),
+        # a higher/more top-down POV the base model never trained on. False selects
+        # the LIBERO floor-manipulation camera (pos=[0.897,0,0.65+workspace_z]).
+        use_composuite_agentview=False,
         **env_kwargs,
     )
     env.seed(seed)
@@ -139,8 +146,19 @@ def run_episode(env, client, prompt, args):
                 obs, _, env_done, last_info = env.step(dummy_action)
                 t += 1
                 continue
-            img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
-            wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+            # Image flip. Default DOUBLE flip [::-1, ::-1] = the original openpi LIBERO
+            # convention (examples/libero/main.py). The closed-loop camera x flip A/B
+            # (experiments/plate_transfer/camera_ab.py, with the replan loop fixed) is
+            # decisive: double-flip grasps box pick&place ~0.5-0.67, single-flip 0.00 on
+            # EITHER camera. (The open-loop one-step MSE in base_flip_ab favored single
+            # flip but did NOT predict closed-loop success -- ignore it for this.) Set
+            # OOTB_SINGLE_FLIP=1 only to reproduce the broken single-flip A/B.
+            if os.environ.get("OOTB_SINGLE_FLIP", "0") == "1":
+                img = np.ascontiguousarray(obs["agentview_image"][::-1])
+                wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1])
+            else:
+                img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+                wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
             img = image_tools.convert_to_uint8(image_tools.resize_with_pad(img, args.resize_size, args.resize_size))
             wrist_img = image_tools.convert_to_uint8(image_tools.resize_with_pad(wrist_img, args.resize_size, args.resize_size))
             replay_images.append(img)
@@ -160,8 +178,13 @@ def run_episode(env, client, prompt, args):
                     ),
                     "prompt": str(prompt),
                 }
-            action_chunk = client.infer(element)["actions"]
-            action_plan.extend(action_chunk[: args.replan_steps])
+                # Replan only when the plan empties, from the CURRENT observation.
+                # (These two lines were previously de-indented out of this `if`,
+                # which left `element` pinned to the t=0 frame and made the plan
+                # grow without ever emptying -- the policy ran blind after frame 0,
+                # never grasping. That bug invalidated earlier OOTB sweeps.)
+                action_chunk = client.infer(element)["actions"]
+                action_plan.extend(action_chunk[: args.replan_steps])
             action = np.asarray(action_plan.popleft(), dtype=np.float32)
             if args.controller == "JOINT_POSITION":
                 action = action[:8]

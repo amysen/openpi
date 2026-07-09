@@ -90,7 +90,7 @@ def _quat2axisangle(quat):
     return (quat[:3] * 2.0 * math.acos(quat[3])) / den
 
 
-def _make_env(robot, object_type, obstacle, objective, seed, controller="OSC_POSE", use_composuite_agentview=False):
+def _make_env(robot, object_type, obstacle, objective, seed, controller="OSC_POSE", use_composuite_agentview=False, target_color="blue", plate_thickness="thin"):
     cfg = load_controller_config(default_controller=controller)
     if controller == "JOINT_POSITION":
         # Defaults are intentionally gentle for arbitrary policies but too
@@ -113,6 +113,13 @@ def _make_env(robot, object_type, obstacle, objective, seed, controller="OSC_POS
         object_type=object_type,
         obstacle=obstacle,
         objective=objective,
+        # Pin the plate color so the training data is reproducible and matches
+        # eval. CompoSuiteEnv defaults target_color="random", which draws ONCE at
+        # construction (unseeded) -> each collection run is monochrome in a random
+        # color (e.g. green one run, blue the next) and eval_plate would roll a
+        # different color -> train/eval visual mismatch on a color-agnostic prompt.
+        target_color=target_color,
+        plate_thickness=plate_thickness,
         controller_configs=cfg,
         camera_names=["agentview", "robot0_eye_in_hand"],
         camera_heights=RES,
@@ -181,13 +188,17 @@ def _perturb_joint_qpos(env, magnitude, rng):
 
 
 def _frames(obs):
-    # Flip rendering convention to match how composuite_smoke feeds the policy.
-    # Match LIBERO's image convention: vertical flip ONLY (not double flip).
-    # Mujoco renders with +y down in the image; one [::-1] makes it right-side
-    # up. Applying [::-1, ::-1] would 180-rotate the image and produce a
-    # horizontally-mirrored framing vs the pi05_libero training data.
-    img = np.ascontiguousarray(obs["agentview_image"][::-1])
-    wrist = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1])
+    # DOUBLE flip [::-1, ::-1] to match the orientation the pi05_libero base was
+    # trained on (openpi examples/libero/main.py) and how composuite_smoke feeds
+    # the policy. The closed-loop camera x flip A/B on the BASE model
+    # (experiments/plate_transfer/camera_ab.py) is decisive: double-flip grasps
+    # box pick&place ~0.5-0.67, single-flip 0.00. Feeding the base its native
+    # (double-flip) orientation lets the plate LoRA build on the pretrained prior
+    # instead of fighting a horizontally-mirrored view. (The old single-flip
+    # [::-1] looked human-upright but mirrored the training POV; the open-loop
+    # base_flip_ab MSE that favored it did not predict closed-loop success.)
+    img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+    wrist = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
     return img, wrist
 
 
@@ -827,9 +838,12 @@ def _side_grasp_phases(obs, env, objective, grasp_orientation):
         plate_grip_offset = plate_r - plate_grip_inset  # 0.035 m from centre
         # Plate XML now contains only the disc; body origin sits at the
         # disc's bottom face (z=0), so disc bottom = body z, disc centre
-        # = body z + 0.008. The static shelf is a separate fixture.
+        # = body z + half-height. The static shelf is a separate fixture.
+        # Half-height comes from the object (0.009 thin / 0.018 thick
+        # curriculum variant) so the pinch lands on the disc centre either way.
         plate_disc_bottom_dz = 0.000
-        plate_disc_center_dz = 0.009
+        plate_disc_center_dz = float(getattr(
+            getattr(env, "composuite_object", None), "disc_half_height", 0.009))
         # 3 cm clearance below disc bottom for lateral approach
         approach_low_z  = obj_pos0[2] + plate_disc_bottom_dz - 0.030
         grasp_z         = obj_pos0[2] + plate_disc_center_dz
@@ -984,7 +998,10 @@ def _side_grasp_phases(obs, env, objective, grasp_orientation):
         # top of the destination shelf. Wrist stays horizontal throughout.
         # second-shelf top z = table_z + 0.120; disc bottom = shelf_top + tiny.
         plate_shelf2_top_z = table_z + 0.120
-        plate_drop_eef_z   = plate_shelf2_top_z + 0.012  # eef height when disc bottom touches shelf
+        # eef holds the disc at its centre; disc bottom touches the shelf when
+        # eef_z = shelf_top + half-height (+3 mm slack). 0.012 for the thin
+        # disc, 0.021 for the thick curriculum disc.
+        plate_drop_eef_z   = plate_shelf2_top_z + plate_disc_center_dz + 0.003
         plate_slide_lead   = 0.02
         # Pull the eef this far in -x past the grasp point. This must take
         # the disc completely clear of the shelf (shelf -x face is ~25 mm
@@ -1125,6 +1142,7 @@ def collect_episode(env, objective, max_steps, num_warmup=10, joint_targets=None
 
     plate_pick_place = objective == "pick_and_place" and grasp_ori == "horizontal_edge"
     images, wrists, states, actions = [], [], [], []
+    phases_rec = []  # per-recorded-frame phase name (for sub-task language splits)
     success_seen = False
     episode_done = False
     total_steps = 0
@@ -1172,6 +1190,7 @@ def collect_episode(env, objective, max_steps, num_warmup=10, joint_targets=None
             wrists.append(wrist)
             states.append(_state8(obs))
             actions.append(act)
+            phases_rec.append(name)
             if joint_targets is not None:
                 joint_targets.append(_robot_qpos(env))
             try:
@@ -1246,6 +1265,10 @@ def collect_episode(env, objective, max_steps, num_warmup=10, joint_targets=None
                 env, obs, images, wrists, states, actions, max_steps - total_steps, joint_targets=joint_targets
             )
             total_steps += extra_steps
+            # The preview helper appends frames without phase labels; keep the
+            # parallel phase list aligned.
+            while len(phases_rec) < len(actions):
+                phases_rec.append("preview")
             diag = {
                 "obj_to_goal": float(np.linalg.norm(np.array(obs["object_pos"]) - np.array(obs["goal_pos"]))),
                 "obj_z": float(obs["object_pos"][2]),
@@ -1361,7 +1384,7 @@ def collect_episode(env, objective, max_steps, num_warmup=10, joint_targets=None
         "last_phase": last_phase,
         "max_non_shoulder_joint_delta": float(max_non_shoulder_joint_delta),
     }
-    return final_success, total_steps, images, wrists, states, actions, diag
+    return final_success, total_steps, images, wrists, states, actions, phases_rec, diag
 
 
 def main():
@@ -1371,6 +1394,13 @@ def main():
     p.add_argument("--target-successes-per-task", type=int, default=5)
     p.add_argument("--max-attempts-per-task", type=int, default=30)
     p.add_argument("--max-steps", type=int, default=300)
+    p.add_argument("--target-color", default="blue", choices=["random", "red", "blue", "green"],
+                   help="Pinned plate color (default blue). 'random' draws one unseeded "
+                        "color per run (monochrome, not reproducible) -- avoid for training data.")
+    p.add_argument("--plate-thickness", default="thin", choices=["thin", "thick"],
+                   help="Curriculum knob: 'thick' spawns the double-thickness plate "
+                        "(36 mm rim) whose side pinch is far more tolerant. Collect "
+                        "stage-1 demos thick, anneal back to thin. Ignored for non-plate.")
     p.add_argument("--out-dir", default="data/composuite/pilot")
     p.add_argument("--seed", type=int, default=11)
     p.add_argument(
@@ -1431,7 +1461,9 @@ def main():
 
         env = _make_env(robot, obj, obstacle, objective, args.seed,
                         controller=args.controller,
-                        use_composuite_agentview=args.use_composuite_agentview)
+                        use_composuite_agentview=args.use_composuite_agentview,
+                        target_color=args.target_color,
+                        plate_thickness=args.plate_thickness)
         n_succ = 0
         attempts = 0
         for attempt in range(args.max_attempts_per_task):
@@ -1443,7 +1475,7 @@ def main():
                 rng = np.random.RandomState(args.seed + attempt + args.init_pose_jitter_seed_offset)
                 jitter_delta = _perturb_joint_qpos(env, args.init_pose_jitter, rng)
             t0 = time.time()
-            ok, steps, imgs, wrs, sts, acts, diag = collect_episode(env, objective, args.max_steps)
+            ok, steps, imgs, wrs, sts, acts, phs, diag = collect_episode(env, objective, args.max_steps)
             if args.init_pose_jitter > 0.0:
                 diag["init_pose_jitter"] = float(args.init_pose_jitter)
                 diag["init_pose_jitter_delta"] = jitter_delta.round(4).tolist()
@@ -1497,6 +1529,9 @@ def main():
                     seed=np.array(args.seed + attempt, dtype=np.int64),
                     task_spec=np.array(f"{robot},{obj},{obstacle},{objective}"),
                     controller=np.array(args.controller),
+                    phase=np.array(phs),
+                    plate_thickness=np.array(args.plate_thickness),
+                    init_pose_jitter=np.array(args.init_pose_jitter, dtype=np.float32),
                 )
                 n_succ += 1
                 summary.append({"task": task_name, "ep": n_succ - 1, "attempt": attempt,

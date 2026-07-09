@@ -996,8 +996,460 @@ _CONFIGS = [
         specific_checkpoints_to_keep=[],
         save_train_state=False,
         wandb_enabled=True,
-        checkpoint_base_dir="checkpoints",
-        assets_base_dir="assets",
+        # Absolute results/ paths so compute_norm_stats.py (which builds the
+        # config purely from its name, with no --assets-base-dir override) writes
+        # norm stats to the SAME directory train.py reads from. Previously this
+        # was relative ("assets"), so compute wrote to repos/openpi/assets while
+        # train_pi05_libero.sh passed --assets-base-dir results/assets -- train
+        # then silently skipped the missing stats (config._load_norm_stats), and
+        # the CompoSuite-specific OOD norm stats never reached training.
+        checkpoint_base_dir="/home/pajak/compositional-learning-vla/results/checkpoints",
+        assets_base_dir="/home/pajak/compositional-learning-vla/results/assets",
+    ),
+    # Forgetting / rehearsal experiment: identical recipe to v1
+    # (pi05_libero_composuite_transfer) -- SAME model, LR schedule (warmup 10k ->
+    # flat 5e-5), batch 32, EMA, 30k steps -- so the only variable vs the
+    # plate-only baseline is the training mix. Dataset = the 100 plate demos
+    # PLUS 30 box trash_can demos (rehearsal anchor), built by
+    # experiments/plate_transfer/prepare_combined_plate_box.sh into the LeRobot
+    # repo composuite_plate_box_trashcan. trash_can chosen over pick_and_place
+    # as the rehearsal target: base pi0.5_libero sits at a MODERATE success rate
+    # on it (~0.4-0.6), so there is a real, fragile skill to lose under plate-only
+    # LoRA -- a more sensitive forgetting/preservation signal than near-ceiling
+    # pick_and_place. Norm stats are computed over the UNION.
+    TrainConfig(
+        name="pi05_libero_composuite_plate_box_trashcan",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="composuite_plate_box_trashcan",
+            assets=AssetsConfig(
+                asset_id="composuite_plate_box_trashcan",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_libero/params"
+        ),
+        num_train_steps=30_000,
+        save_interval=1_000,
+        log_interval=10,
+        keep_period=None,
+        specific_checkpoints_to_keep=[],
+        save_train_state=False,
+        wandb_enabled=True,
+        checkpoint_base_dir="/home/pajak/compositional-learning-vla/results/checkpoints",
+        assets_base_dir="/home/pajak/compositional-learning-vla/results/assets",
+    ),
+    # Fix experiment (1) -- norm-stats: SAME 100-plate + 30-trash_can dataset
+    # (composuite_plate_box_trashcan) as pi05_libero_composuite_plate_box_trashcan,
+    # but normalized with the PLATE-ONLY norm stats instead of the union. Tests whether
+    # the union's ~30-38% wider translation-action std (box top-grasp variance), which
+    # compresses plate's side-grasp deltas in normalized space, is what suppressed plate
+    # learning (mixed model under-acts: leaves plate ~21cm from goal, 0/20 even in-dist).
+    # The plate-only norm_stats.json is copied into this config's asset dir before train.
+    # keep_period=5000 bounds checkpoint disk (diagnostic run; eval at milestones).
+    TrainConfig(
+        name="pi05_libero_composuite_plate_box_trashcan_platenorm",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="composuite_plate_box_trashcan",
+            assets=AssetsConfig(
+                asset_id="composuite_plate_box_trashcan",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_libero/params"
+        ),
+        num_train_steps=30_000,
+        save_interval=1_000,
+        log_interval=10,
+        keep_period=5000,
+        specific_checkpoints_to_keep=[],
+        save_train_state=False,
+        wandb_enabled=True,
+        checkpoint_base_dir="/home/pajak/compositional-learning-vla/results/checkpoints",
+        assets_base_dir="/home/pajak/compositional-learning-vla/results/assets",
+    ),
+    # Fix experiment (2) -- data ratio: 100 plate + only 5 trash_can demos (vs 30), so the
+    # box footprint is ~5% of the mix -- barely perturbs plate while (hopefully) still
+    # anchoring the box skill (box generalized from little signal before). Dataset
+    # composuite_plate_box5_trashcan (built by prepare_combined_plate_box.sh with a 5-demo
+    # box subset); norm stats over this plate-dominated union. keep_period=5000.
+    TrainConfig(
+        name="pi05_libero_composuite_plate_box5_trashcan",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="composuite_plate_box5_trashcan",
+            assets=AssetsConfig(
+                asset_id="composuite_plate_box5_trashcan",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_libero/params"
+        ),
+        num_train_steps=30_000,
+        save_interval=1_000,
+        log_interval=10,
+        keep_period=5000,
+        specific_checkpoints_to_keep=[],
+        save_train_state=False,
+        wandb_enabled=True,
+        checkpoint_base_dir="/home/pajak/compositional-learning-vla/results/checkpoints",
+        assets_base_dir="/home/pajak/compositional-learning-vla/results/assets",
+    ),
+    # Fix experiment (3) -- LoRA capacity: SAME 100-plate + 30-trash_can dataset and UNION
+    # norm stats as pi05_libero_composuite_plate_box_trashcan (the failing rehearsal run),
+    # but DOUBLES the LoRA rank (paligemma 16->32, action expert 32->64). Confirms whether
+    # the mixed model's plate failure is adapter capacity. Expected: NO -- plate-only with
+    # rank-16 also barely learns plate, so capacity isn't the binding constraint -- but we
+    # run it to rule it out. Union norm_stats.json is copied into this config's asset dir.
+    TrainConfig(
+        name="pi05_libero_composuite_plate_box_trashcan_biglora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora_r32",
+            action_expert_variant="gemma_300m_lora_r64",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="composuite_plate_box_trashcan",
+            assets=AssetsConfig(
+                asset_id="composuite_plate_box_trashcan",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora_r32",
+            action_expert_variant="gemma_300m_lora_r64",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_libero/params"
+        ),
+        num_train_steps=30_000,
+        save_interval=1_000,
+        log_interval=10,
+        keep_period=5000,
+        specific_checkpoints_to_keep=[],
+        save_train_state=False,
+        wandb_enabled=True,
+        checkpoint_base_dir="/home/pajak/compositional-learning-vla/results/checkpoints",
+        assets_base_dir="/home/pajak/compositional-learning-vla/results/assets",
+    ),
+    # Paper-matched replay run (Zhu et al. 2026, real-world continual VLA). Combines the
+    # best-practice levers: (a) buffer size B=0.2 -> 20 box trash_can demos per 100 plate;
+    # (b) consistent/anchored norm stats (their "Strategy-I") -- the PLATE-ONLY norm stats
+    # are copied into this config's asset dir (not the diluted union); (c) short warmup +
+    # cosine decay 5e-5 -> 5e-6 (their recipe) instead of the 10k flat warmup. Goal: ONE
+    # model that does plate (new, hard/OOD task -- expect ~plate-only ceiling, not mastery)
+    # AND retains box (old skill, preserved by replay; trash_can replay also generalizes to
+    # box pick&place). Differs from the paper: LoRA (not full SFT), batch 32 (not 128).
+    TrainConfig(
+        name="pi05_libero_composuite_plate_box20_papermatch",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="composuite_plate_box20_trashcan",
+            assets=AssetsConfig(
+                asset_id="composuite_plate_box20_trashcan",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=300,
+            peak_lr=5e-5,
+            decay_steps=6_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.998,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_libero/params"
+        ),
+        num_train_steps=6_000,
+        save_interval=1_000,
+        log_interval=10,
+        keep_period=None,
+        specific_checkpoints_to_keep=[],
+        save_train_state=False,
+        wandb_enabled=True,
+        checkpoint_base_dir="/home/pajak/compositional-learning-vla/results/checkpoints",
+        assets_base_dir="/home/pajak/compositional-learning-vla/results/assets",
+    ),
+    # Phase B (sequential continuation, per Zhu et al. 2026). Init from the PLATE-COMPETENT
+    # plate-only 10k checkpoint (= Phase A: the side-grasp wrist primitive already formed --
+    # 90% side-grasp, 75% carry), then GENTLY recover box via replay while rehearsing plate.
+    # Sequential staging avoids the joint-training domination that killed the wrist in the
+    # papermatch CO-training run (which started from the box-competent base and never grew the
+    # side-grasp). Low LR + short, to disturb the plate weights as little as possible; plate-
+    # anchored norm stats (Strategy-I, copied into this config's asset dir). Watch the wrist/
+    # carry stages vs box recovery at each checkpoint.
+    TrainConfig(
+        name="pi05_libero_composuite_plate_box20_phaseB",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="composuite_plate_box20_trashcan",
+            assets=AssetsConfig(
+                asset_id="composuite_plate_box20_trashcan",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        # Gentle continuation: low peak LR, tiny warmup, decay -- recover box without
+        # large weight moves that would erode the plate side-grasp.
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=1e-5,
+            decay_steps=4_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        # Init from the Phase-A (plate-only) 10k checkpoint, NOT the base.
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/pajak/compositional-learning-vla/results/checkpoints/"
+            "pi05_libero_composuite_transfer_v2/plate_doubleflip_blue_fixedlr/10000/params"
+        ),
+        num_train_steps=4_000,
+        save_interval=1_000,
+        log_interval=10,
+        keep_period=None,
+        specific_checkpoints_to_keep=[],
+        save_train_state=False,
+        wandb_enabled=True,
+        checkpoint_base_dir="/home/pajak/compositional-learning-vla/results/checkpoints",
+        assets_base_dir="/home/pajak/compositional-learning-vla/results/assets",
+    ),
+    # Stronger-recipe re-run of pi05_libero_composuite_transfer. The v1 sanity run
+    # underfit (25% in-distribution on its own training layouts). Diagnosis: v1
+    # copied the reference's batch-256 schedule -- warmup 10_000 (a THIRD of a 30k
+    # run spent ramping up) at a flat low peak_lr=5e-5. This v2 keeps everything
+    # else identical (same data, batch 32, 30k steps, EMA) and changes ONLY the LR
+    # schedule: short warmup, 2x peak LR, and an actual cosine decay across the run.
+    TrainConfig(
+        name="pi05_libero_composuite_transfer_v2",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="composuite_plate_transfer_sanity",
+            assets=AssetsConfig(
+                asset_id="composuite_plate_transfer_sanity",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        # Fixed LR matching the pi05_libero LIBERO fine-tune: warm up, then hold
+        # FLAT at 5e-5 (peak == decay over a 1M-step horizon, so it never really
+        # decays within the run). The previous 1e-4 -> 1e-5 cosine decay over 30k
+        # trained slowly with no real improvement; this returns to the LIBERO recipe.
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_libero/params"
+        ),
+        num_train_steps=30_000,
+        save_interval=1_000,
+        log_interval=10,
+        keep_period=None,
+        specific_checkpoints_to_keep=[],
+        save_train_state=False,
+        wandb_enabled=True,
+        checkpoint_base_dir="/home/pajak/compositional-learning-vla/results/checkpoints",
+        assets_base_dir="/home/pajak/compositional-learning-vla/results/assets",
+    ),
+    # v3 -- data-format experiment: identical recipe to transfer_v2 (the ~20%
+    # plate baseline: same model, LoRA, batch 32, 10k-warmup flat 5e-5, EMA,
+    # 30k steps, base pi05_libero init). The ONLY change is the training data:
+    # the same 100 seed-11 trajectories (regenerated as plate_libero_framing_v2
+    # _phases with per-frame phase labels), converted with --retime (merges the
+    # P-controller convergence tails; median commanded |dpos| 0.12 -> 0.52,
+    # ~3.7x fewer frames -- attacks the measured under-acting: rollouts stalled
+    # ~21cm short) and --subtask-split mixed (each episode also emitted as 3
+    # phase-labeled sub-task segments with their own prompts, matching pi0.5's
+    # subtask-decomposition pretraining; the full-prompt episode is kept so
+    # full-prompt eval stays in-distribution). Any eval delta vs transfer_v2 is
+    # attributable purely to the data formatting.
+    # Build the dataset with:
+    #   EPISODES_DIR=.../plate_libero_framing_v2_phases/episodes \
+    #   REPO_ID=composuite_plate_retimed_subtask \
+    #   RETIME_ARGS="--subtask-split mixed" \
+    #   bash experiments/plate_transfer/convert_demos_retimed.sh
+    TrainConfig(
+        name="pi05_libero_composuite_transfer_v3",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="composuite_plate_retimed_subtask",
+            assets=AssetsConfig(
+                asset_id="composuite_plate_retimed_subtask",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_libero/params"
+        ),
+        num_train_steps=30_000,
+        save_interval=1_000,
+        log_interval=10,
+        keep_period=5000,
+        specific_checkpoints_to_keep=[],
+        save_train_state=False,
+        wandb_enabled=True,
+        checkpoint_base_dir="/home/pajak/compositional-learning-vla/results/checkpoints",
+        assets_base_dir="/home/pajak/compositional-learning-vla/results/assets",
     ),
     TrainConfig(
         name="pi05_libero_composuite_plate_lora",
