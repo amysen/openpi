@@ -97,7 +97,7 @@ def _build_env(
     return env
 
 
-def _obs_to_policy_input(obs, prompt, convention: str = "plate"):
+def _obs_to_policy_input(obs, prompt, convention: str = "ootb"):
     # Image convention, with flip and resize controlled INDEPENDENTLY so we can
     # isolate which one matters:
     #   plate        = [::-1]        , no resize   (the plate fine-tuning dataset)
@@ -135,7 +135,8 @@ PROMPT = "pull the plate off the stand and place it on top of the second stand"
 
 def _run_trial(
     env, policy, max_steps: int, replan_steps: int, seed: int, prompt: str = PROMPT,
-    end_on_release: bool = False, obs_convention: str = "plate",
+    end_on_release: bool = False, obs_convention: str = "ootb",
+    num_steps_wait: int = 10,
 ):
     env.seed(seed)
     obs = env.reset()
@@ -155,6 +156,15 @@ def _run_trial(
     # OPENS the gripper (releases the object) -- success can fire while still grasped,
     # so a fixed tail may cut off before the policy's own release -- then stop after a
     # brief settle. This is the model's real behaviour; nothing is scripted.
+    # Upstream-fidelity settle: openpi's LIBERO eval (examples/libero/main.py,
+    # num_steps_wait=10) steps a dummy open-gripper action while objects
+    # stabilize after reset, before the first inference.
+    for _ in range(num_steps_wait):
+        try:
+            obs, _r, _done, _info = env.step([0.0] * 6 + [-1.0])
+        except Exception as e:
+            logging.warning(f"env.step error during settle: {e}")
+            break
     POST_SUCCESS_FRAMES = 45
     RELEASE_SPREAD = 0.05       # finger-spread above this => gripper opened (released)
     SETTLE_AFTER_RELEASE = 50  # let the plate fall + come to rest before we read its position
@@ -201,6 +211,12 @@ def _run_trial(
                 approach_quat = [float(v) for v in _q]
         except Exception:
             pass
+        if info.get("terminated_reason") == "illegal_lift":
+            # Push objective: the env ends the episode when the object rises
+            # >3cm off the table (PushReward). Honor it as a terminal failure,
+            # else a pick-and-carry to the goal masquerades as push success
+            # (the reason OOTB-sweep push rows were quarantined).
+            break
         if info.get("success") and not last_success:
             last_success = True
             success_t = t
@@ -283,12 +299,12 @@ def main():
     )
     p.add_argument(
         "--obs-convention",
-        default="plate",
+        default="ootb",
         choices=["plate", "ootb", "vh_noresize", "v_resize"],
-        help="Image convention. 'plate' = [::-1] (the plate fine-tuning dataset). "
-        "'ootb' = [::-1,::-1] + resize_with_pad(224) = pi0.5-LIBERO's actual "
-        "pretraining/eval convention (openpi examples/libero/main.py). Use 'ootb' "
-        "to evaluate the BASE model faithfully.",
+        help="Image convention. 'ootb' (default) = [::-1,::-1] + resize_with_pad(224) "
+        "= pi0.5-LIBERO's pretraining/eval convention (openpi examples/libero/main.py) "
+        "and the current collector's orientation; closed-loop camera_ab was decisive "
+        "for it. 'plate' = [::-1], only for legacy single-flip-era checkpoints.",
     )
     p.add_argument(
         "--prompt",

@@ -218,6 +218,14 @@ def main():
              "exit without writing any dataset. Use to tune the retime targets.",
     )
     p.add_argument(
+        "--mirror-horizontal", action="store_true",
+        help="Mirror frames along width. Legacy single-flip-era NPZs (collector "
+             "before the double-flip revert) store raw[::-1]; the pi0.5-LIBERO "
+             "base was trained on raw[::-1,::-1]. stored[:, ::-1] converts "
+             "single-flip to the double-flip orientation exactly. Do NOT use on "
+             "NPZs collected by the current double-flip collector.",
+    )
+    p.add_argument(
         "--subtask-split", default="off", choices=["off", "segments", "mixed"],
         help="Split each episode into sub-task segments with their own language "
              "prompts (phase labels when present, kinematic fallback otherwise). "
@@ -334,6 +342,11 @@ def main():
         # array (~25MB) per frame. Pull each array out once.
         images = d["image"]
         wrist_images = d["wrist_image"]
+        if args.mirror_horizontal:
+            # ascontiguousarray: the width-reversed view has negative strides,
+            # which the LeRobot image writer (PIL buffer protocol) rejects.
+            images = np.ascontiguousarray(images[:, :, ::-1])
+            wrist_images = np.ascontiguousarray(wrist_images[:, :, ::-1])
         states = d["state"].astype(np.float32, copy=False)
         actions = d["actions"].astype(np.float32, copy=False)
         phases = d["phase"] if "phase" in d.files else None
@@ -359,6 +372,15 @@ def main():
         # applied per emitted episode so no merge crosses a segment boundary.
         emissions = []
         if args.subtask_split in ("segments", "mixed"):
+            # PLATE_SUBTASK_SEGMENTS phase names and the phase-less kinematic
+            # fallback both hard-code plate prompts; running them on another
+            # object would silently stamp plate language onto its episodes.
+            if "plate" not in task.lower():
+                raise ValueError(
+                    f"--subtask-split={args.subtask_split} is plate-specific but "
+                    f"episode task is {task!r} ({npz_path}). Convert non-plate "
+                    "data with --subtask-split off."
+                )
             for seg_task, sl in _subtask_slices(actions, states, phases):
                 if sl.stop - sl.start >= 10:
                     emissions.append((seg_task or task, sl))
