@@ -72,7 +72,11 @@ ROT_MAX_PER_STEP = 0.30  # cap rotation delta magnitude per step (avoid IK shove
 # Geometry constants for side-grasp objects (from composuite_*.xml).
 PLATE_RADIUS = 0.06
 DUMBBELL_BAR_RADIUS = 0.012
-DUMBBELL_BAR_MID_Z = 0.065     # bar midpoint above object body origin
+DUMBBELL_BAR_MID_Z = 0.080     # bar midpoint above object body origin
+# (composuite_dumbbell.xml: weights r=0.055 span z 0.00-0.05 and 0.11-0.16,
+#  bar r=0.010 spans z 0.05-0.11 -> exposed bar centre = 0.080. The dumbbell
+#  stands UPRIGHT, so the bar is VERTICAL: pinch it with the fingers opening
+#  HORIZONTALLY, not with the vertical plate-rim opening.)
 # Approach the side-grasp objects from +x of the object so that the gripper
 # z-axis points in -x. The robot base sits at +y, so a +x stand-off keeps the
 # end-effector well within the reachable workspace from the front-left bin.
@@ -535,6 +539,21 @@ def _side_grasp_quat(approach_dir_xy, tilt_up_deg=0.0, wrist_below=False):
     return T.mat2quat(R)
 
 
+def _upright_bar_grasp_quat(approach_dir_xy):
+    """World-frame quaternion (x,y,z,w) for pinching a VERTICAL bar from the
+    side: gripper +z (fingertip-forward) points horizontally along
+    approach_dir_xy and the finger-open axis is HORIZONTAL (perpendicular to
+    the approach in the table plane), so closing pinches the bar's left and
+    right sides. Used for the upright dumbbell's exposed bar segment."""
+    n = np.linalg.norm(approach_dir_xy)
+    ax, ay = float(approach_dir_xy[0] / n), float(approach_dir_xy[1] / n)
+    z_axis = np.array([ax, ay, 0.0])
+    y_axis = np.array([-ay, ax, 0.0])  # horizontal, perpendicular to approach
+    x_axis = np.cross(y_axis, z_axis)
+    R = np.column_stack([x_axis, y_axis, z_axis])
+    return T.mat2quat(R)
+
+
 def _topdown_radial_quat(approach_dir_xy):
     """World-frame quaternion (x,y,z,w) for a TOP-DOWN grasp where the fingers
     open RADIALLY along approach_dir_xy (one outside the rim, one inside).
@@ -859,12 +878,15 @@ def _side_grasp_phases(obs, env, objective, grasp_orientation):
         place_dir = approach_dir.copy()
         place_quat = carry_quat
 
-    else:  # horizontal_bar  (dumbbell)
+    else:  # horizontal_bar  (upright dumbbell: VERTICAL exposed bar)
         # Bar passes through the object centre xy; grip at bar mid-height.
         grasp_z = max(obj_pos0[2] + DUMBBELL_BAR_MID_Z, table_z + 0.05)
         grasp_xy = obj_pos0[:2].copy()
         approach_dir = SIDE_APPROACH_DIR / np.linalg.norm(SIDE_APPROACH_DIR)
-        target_quat  = _side_grasp_quat(approach_dir)
+        # The bar is vertical (weights above and below), so the fingers must
+        # open HORIZONTALLY to pinch its sides; the plate-rim vertical opening
+        # just shoves the weight discs (G1 smoke: 0/50, all stuck pre-grasp).
+        target_quat  = _upright_bar_grasp_quat(approach_dir)
         carry_quat   = target_quat  # dumbbell pinch is around its waist; no tilt needed
         # For dumbbell: approach_low_z == grasp_z (no need to go below first)
         approach_low_z = grasp_z
