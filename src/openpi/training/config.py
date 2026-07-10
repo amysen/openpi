@@ -1290,6 +1290,63 @@ _CONFIGS = [
         checkpoint_base_dir="/home/pajak/compositional-learning-vla/results/checkpoints",
         assets_base_dir="/home/pajak/compositional-learning-vla/results/assets",
     ),
+    # ------------------------------------------------------------------
+    # ICRA-2027 interference study: FROZEN PROTOCOL configs (Blocks A-G).
+    # Recipe pre-registered in experiments/interference/PROTOCOL.md: LoRA r16,
+    # batch 32, EMA 0.998, warmup 300 -> peak 5e-5 -> cosine to 5e-6 over 10k,
+    # save every 2k, retimed single-prompt datasets, union quantile norm stats.
+    # Block A: new-task-only baselines.
+    *[
+        TrainConfig(
+            name=f"pi05_libero_protocol_{tag}",
+            model=pi0_config.Pi0Config(
+                pi05=True,
+                action_horizon=10,
+                discrete_state_input=False,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ),
+            data=LeRobotLiberoDataConfig(
+                repo_id=repo,
+                assets=AssetsConfig(asset_id=repo),
+                base_config=DataConfig(prompt_from_task=True),
+                extra_delta_transform=False,
+            ),
+            batch_size=32,
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=300,
+                peak_lr=5e-5,
+                decay_steps=10_000,
+                decay_lr=5e-6,
+            ),
+            optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+            ema_decay=0.998,
+            freeze_filter=pi0_config.Pi0Config(
+                pi05=True,
+                action_horizon=10,
+                discrete_state_input=False,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ).get_freeze_filter(),
+            weight_loader=weight_loaders.CheckpointWeightLoader(
+                "gs://openpi-assets/checkpoints/pi05_libero/params"
+            ),
+            num_train_steps=10_000,
+            save_interval=2_000,
+            log_interval=10,
+            keep_period=None,
+            specific_checkpoints_to_keep=[],
+            save_train_state=False,
+            wandb_enabled=True,
+            checkpoint_base_dir="/home/pajak/compositional-learning-vla/results/checkpoints",
+            assets_base_dir="/home/pajak/compositional-learning-vla/results/assets",
+        )
+        for tag, repo in [
+            ("plate", "composuite_plate_protocol"),
+            ("dumbbell_tc", "composuite_dumbbell_tc_protocol"),
+            ("box_shelf", "composuite_box_shelf_protocol"),
+        ]
+    ],
     # Phase B (sequential continuation, per Zhu et al. 2026). Init from the PLATE-COMPETENT
     # plate-only 10k checkpoint (= Phase A: the side-grasp wrist primitive already formed --
     # 90% side-grasp, 75% carry), then GENTLY recover box via replay while rehearsing plate.

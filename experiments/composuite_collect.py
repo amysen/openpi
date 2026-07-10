@@ -960,8 +960,11 @@ def _side_grasp_phases(obs, env, objective, grasp_orientation):
     # so any rapid lateral acceleration can pop it free. Reduce the per-step
     # translational action cap for the plate carry so the gripper accelerates
     # gently and the disc stays pinched. Other objects use the default 1.0.
-    carry_pos_max = 0.12 if grasp_orientation == "horizontal_edge" else 1.0
-    place_pos_max = 0.08 if grasp_orientation == "horizontal_edge" else 1.0
+    # Both side-grasp pinches (plate rim, dumbbell bar) hold the object by
+    # friction on a small contact patch: full-speed OSC carries shear the
+    # object out of the pinch (dumbbell G1: slipped during move_over at 1.0).
+    carry_pos_max = 0.12 if grasp_orientation in ("horizontal_edge", "horizontal_bar") else 1.0
+    place_pos_max = 0.08 if grasp_orientation in ("horizontal_edge", "horizontal_bar") else 1.0
     retreat_pos_max = 0.12 if grasp_orientation == "horizontal_edge" else 1.0
     if grasp_orientation == "horizontal_edge" and goal_pos[1] < 0.0:
         # The right-side (negative-y) goal sits at the edge of the Panda's
@@ -1102,6 +1105,25 @@ def _side_grasp_phases(obs, env, objective, grasp_orientation):
             ("open",           np.array([cmd_goal_eef_xy[0], cmd_goal_eef_xy[1], plate_drop_eef_z]),
                               place_quat, GRIP_OPEN, None, 10, place_pos_max),
             *clear_after_open_phases,
+        ]
+    if grasp_orientation == "horizontal_bar":
+        # Upright dumbbell: it stands free on the table (nothing to slide off)
+        # and hangs 0.08 m below the eef when pinched at the bar. Dragging it
+        # sideways before lift topples it; descending into the trash can with
+        # drop_z sized for a box rams the bottom weight into the rim. Lift
+        # straight up, carry slowly, release high enough that the bottom
+        # weight clears the rim and gravity drops it in.
+        bar_drop_z = drop_z
+        if objective == "trash_can":
+            bar_drop_z = table_z + 0.29   # bottom weight ~0.06 above rim
+        return phases + [
+            ("lift",           np.array([grasp_xy[0], grasp_xy[1], carry_z]),                 carry_quat,  GRIP_CLOSE, 0.02,    PHASE_MAX_STEPS, carry_pos_max),
+            ("carry_mid",      np.array([(grasp_xy[0]+goal_eef_xy[0])*0.5,
+                                          (grasp_xy[1]+goal_eef_xy[1])*0.5, carry_z]),        carry_quat,  GRIP_CLOSE, 0.03,    PHASE_MAX_STEPS, carry_pos_max),
+            ("move_over",      np.array([goal_eef_xy[0], goal_eef_xy[1], carry_z]),           carry_quat,  GRIP_CLOSE, 0.02,    PHASE_MAX_STEPS, carry_pos_max),
+            ("descend_target", np.array([goal_eef_xy[0], goal_eef_xy[1], bar_drop_z]),        carry_quat,  GRIP_CLOSE, 0.01,    PHASE_MAX_STEPS * 2, place_pos_max),
+            ("open",           None,                                                          carry_quat,  GRIP_OPEN,  None,    HOLD_STEPS["open"]),
+            ("retract",        np.array([goal_eef_xy[0], goal_eef_xy[1], carry_z + 0.05]),    carry_quat,  GRIP_OPEN,  0.03,    PHASE_MAX_STEPS),
         ]
     return phases + [
         # Slide the disc OFF the shelf horizontally before lifting. The disc
