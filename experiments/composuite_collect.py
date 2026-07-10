@@ -962,9 +962,16 @@ def _side_grasp_phases(obs, env, objective, grasp_orientation):
     # gently and the disc stays pinched. Other objects use the default 1.0.
     # Both side-grasp pinches (plate rim, dumbbell bar) hold the object by
     # friction on a small contact patch: full-speed OSC carries shear the
-    # object out of the pinch (dumbbell G1: slipped during move_over at 1.0).
-    carry_pos_max = 0.12 if grasp_orientation in ("horizontal_edge", "horizontal_bar") else 1.0
-    place_pos_max = 0.08 if grasp_orientation in ("horizontal_edge", "horizontal_bar") else 1.0
+    # object out of the pinch (dumbbell G1: slipped during move_over at 1.0,
+    # while the plate's 0.12 exhausted the episode budget mid-descend — the
+    # bar pinch wraps a cylinder, so it tolerates a brisker carry than the
+    # plate's face pinch).
+    if grasp_orientation == "horizontal_edge":
+        carry_pos_max, place_pos_max = 0.12, 0.08
+    elif grasp_orientation == "horizontal_bar":
+        carry_pos_max, place_pos_max = 0.18, 0.10
+    else:
+        carry_pos_max, place_pos_max = 1.0, 1.0
     retreat_pos_max = 0.12 if grasp_orientation == "horizontal_edge" else 1.0
     if grasp_orientation == "horizontal_edge" and goal_pos[1] < 0.0:
         # The right-side (negative-y) goal sits at the edge of the Panda's
@@ -998,7 +1005,16 @@ def _side_grasp_phases(obs, env, objective, grasp_orientation):
                                 ])[1],
                                 grasp_z,
                             ])) if grasp_orientation == "horizontal_edge" else
-                          np.array([cmd_grasp_xy[0], cmd_grasp_xy[1], grasp_z]),
+                          # Bar case: closed-loop on the CURRENT bar xy. The
+                          # open-loop initial-position target closes off-centre
+                          # whenever the approach nudges the dumbbell, and an
+                          # off-centre pinch on the 1 cm bar torques the
+                          # top-heavy dumbbell over (G1 attempt 5).
+                          (lambda obs: np.array([
+                                np.array(obs["object_pos"])[0],
+                                np.array(obs["object_pos"])[1],
+                                grasp_z,
+                            ])),
                           target_quat, GRIP_OPEN,  0.005,   PHASE_MAX_STEPS * 2),
         # Phase 5: dummy rise (no-op for plate, kept for dumbbell which sets
         #          approach_low_z = grasp_z so this is a hold-in-place).
@@ -1113,9 +1129,22 @@ def _side_grasp_phases(obs, env, objective, grasp_orientation):
         # drop_z sized for a box rams the bottom weight into the rim. Lift
         # straight up, carry slowly, release high enough that the bottom
         # weight clears the rim and gravity drops it in.
-        bar_drop_z = drop_z
+        # Release geometry: the top weight (11 cm dia) cannot pass the 8 cm
+        # finger opening, so after GRIP_OPEN the dumbbell HANGS by its top
+        # weight on the fingertips (G1 attempt 4: all 50 runs ended at retract
+        # still carrying it). The fingers must exit HORIZONTALLY, the way they
+        # came in, and for trash_can the bottom weight must already be inside
+        # the can mouth (below the rim) so the can wall stops the dumbbell
+        # from following the fingers out.
         if objective == "trash_can":
-            bar_drop_z = table_z + 0.29   # bottom weight ~0.06 above rim
+            bar_drop_z = table_z + 0.22   # bottom weight ~1 cm below rim, captured by the mouth
+        elif objective == "shelf":
+            bar_drop_z = table_z + 0.255  # bottom weight ~0.5 cm above the shelf top
+        elif objective == "pick_and_place":
+            bar_drop_z = table_z + 0.09   # bottom weight ~1 cm above the tray floor
+        else:
+            bar_drop_z = drop_z
+        retreat_xy = goal_eef_xy - approach_dir * 0.15
         return phases + [
             ("lift",           np.array([grasp_xy[0], grasp_xy[1], carry_z]),                 carry_quat,  GRIP_CLOSE, 0.02,    PHASE_MAX_STEPS, carry_pos_max),
             ("carry_mid",      np.array([(grasp_xy[0]+goal_eef_xy[0])*0.5,
@@ -1123,7 +1152,10 @@ def _side_grasp_phases(obs, env, objective, grasp_orientation):
             ("move_over",      np.array([goal_eef_xy[0], goal_eef_xy[1], carry_z]),           carry_quat,  GRIP_CLOSE, 0.02,    PHASE_MAX_STEPS, carry_pos_max),
             ("descend_target", np.array([goal_eef_xy[0], goal_eef_xy[1], bar_drop_z]),        carry_quat,  GRIP_CLOSE, 0.01,    PHASE_MAX_STEPS * 2, place_pos_max),
             ("open",           None,                                                          carry_quat,  GRIP_OPEN,  None,    HOLD_STEPS["open"]),
-            ("retract",        np.array([goal_eef_xy[0], goal_eef_xy[1], carry_z + 0.05]),    carry_quat,  GRIP_OPEN,  0.03,    PHASE_MAX_STEPS),
+            # Slide the open fingers back out from between the weights at the
+            # release height; only then lift clear.
+            ("retract_side",   np.array([retreat_xy[0], retreat_xy[1], bar_drop_z]),          carry_quat,  GRIP_OPEN,  0.02,    PHASE_MAX_STEPS, place_pos_max),
+            ("retract",        np.array([retreat_xy[0], retreat_xy[1], carry_z + 0.05]),      carry_quat,  GRIP_OPEN,  0.03,    PHASE_MAX_STEPS),
         ]
     return phases + [
         # Slide the disc OFF the shelf horizontally before lifting. The disc
@@ -1191,6 +1223,7 @@ def collect_episode(env, objective, max_steps, num_warmup=10, joint_targets=None
     episode_done = False
     total_steps = 0
     last_phase = "init"
+    obj_z_max = float(np.array(obs["object_pos"])[2])  # failure-stage triage: lifted vs never-grasped
     plate_joint_lock = None
     max_non_shoulder_joint_delta = 0.0
     for ph in phases:
@@ -1285,6 +1318,7 @@ def collect_episode(env, objective, max_steps, num_warmup=10, joint_targets=None
                 logging.info("    fingers=%s gq=%s", positions, np.round(gq, 4).tolist())
         except Exception as e:
             logging.info("    finger debug failed: %s", e)
+        obj_z_max = max(obj_z_max, float(np.array(obs["object_pos"])[2]))
         logging.info(
             "  end-phase=%-15s eef=%s obj=%s eef_quat=%s",
             name,
@@ -1424,6 +1458,7 @@ def collect_episode(env, objective, max_steps, num_warmup=10, joint_targets=None
         "controller": controller,
         "obj_to_goal": float(np.linalg.norm(np.array(obs["object_pos"]) - np.array(obs["goal_pos"]))),
         "obj_z": float(obs["object_pos"][2]),
+        "obj_z_max": float(obj_z_max),
         "table_z": float(table_z),
         "last_phase": last_phase,
         "max_non_shoulder_joint_delta": float(max_non_shoulder_joint_delta),
