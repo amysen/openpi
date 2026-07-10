@@ -539,15 +539,18 @@ def _side_grasp_quat(approach_dir_xy, tilt_up_deg=0.0, wrist_below=False):
     return T.mat2quat(R)
 
 
-def _upright_bar_grasp_quat(approach_dir_xy):
+def _upright_bar_grasp_quat(approach_dir_xy, tilt_up_deg=0.0):
     """World-frame quaternion (x,y,z,w) for pinching a VERTICAL bar from the
-    side: gripper +z (fingertip-forward) points horizontally along
-    approach_dir_xy and the finger-open axis is HORIZONTAL (perpendicular to
-    the approach in the table plane), so closing pinches the bar's left and
-    right sides. Used for the upright dumbbell's exposed bar segment."""
+    side: gripper +z (fingertip-forward) points along approach_dir_xy tilted
+    tilt_up_deg above horizontal, and the finger-open axis stays HORIZONTAL
+    (perpendicular to the approach), so closing pinches the bar's left and
+    right sides. Keep tilt at 0: G1 attempt 7 showed tilted pads contact the
+    vertical bar edge-on and lose the pinch, without reducing topples."""
     n = np.linalg.norm(approach_dir_xy)
     ax, ay = float(approach_dir_xy[0] / n), float(approach_dir_xy[1] / n)
-    z_axis = np.array([ax, ay, 0.0])
+    t = np.deg2rad(tilt_up_deg)
+    ct, st = np.cos(t), np.sin(t)
+    z_axis = np.array([ax * ct, ay * ct, st])
     y_axis = np.array([-ay, ax, 0.0])  # horizontal, perpendicular to approach
     x_axis = np.cross(y_axis, z_axis)
     R = np.column_stack([x_axis, y_axis, z_axis])
@@ -984,15 +987,41 @@ def _side_grasp_phases(obs, env, objective, grasp_orientation):
         place_pos_max = 0.14
         retreat_pos_max = 0.18
 
+    # Transit altitude must clear the OBJECT TOP plus the horizontally-
+    # pointing fingertips (which sweep at eef height, ~10 cm ahead of the
+    # wrist). obj+0.20 suits the 2 cm plate; the 16 cm upright dumbbell's top
+    # is at obj+0.16, and the diagonal home->approach sweep at obj+0.20
+    # clipped its top weight on ~40% of spawns (G1 attempts 1-11).
+    transit_z = obj_pos0[2] + (0.30 if grasp_orientation == "horizontal_bar" else 0.20)
     phases = [
         # Phase 1: pure wrist rotation, actively holding the current eef xyz.
         ("orient_wrist",   np.array(obs["robot0_eef_pos"]).copy(),                          target_quat, GRIP_OPEN,  POS_TOL, PHASE_MAX_STEPS),
-        # Phase 2: move to approach_xy at height well above disc (no disc contact).
-        ("rotate_above",   np.array([cmd_approach_xy[0], cmd_approach_xy[1], obj_pos0[2] + 0.20]), target_quat, GRIP_OPEN,  POS_TOL, PHASE_MAX_STEPS),
+    ] + ([
+        # Bar case: climb to transit altitude BEFORE any lateral motion, so
+        # the early diagonal of the sweep cannot pass through the object.
+        ("rise_clear",     np.array([float(np.array(obs["robot0_eef_pos"])[0]),
+                                      float(np.array(obs["robot0_eef_pos"])[1]), transit_z]), target_quat, GRIP_OPEN, 0.01, PHASE_MAX_STEPS),
+    ] if grasp_orientation == "horizontal_bar" else []) + [
+        # Phase 2: move to approach_xy at transit altitude (no object contact).
+        ("rotate_above",   np.array([cmd_approach_xy[0], cmd_approach_xy[1], transit_z]),   target_quat, GRIP_OPEN,  POS_TOL, PHASE_MAX_STEPS),
         # Phase 3: descend OUTSIDE the disc footprint to grasp height. Open
         #          fingers straddle the disc edge plane in clear air (top
         #          finger above disc top, bottom finger below disc bottom).
-        ("descend_outside", np.array([cmd_approach_xy[0], cmd_approach_xy[1], grasp_z]),     target_quat, GRIP_OPEN,  0.005,   PHASE_MAX_STEPS),
+        ("descend_outside", (lambda obs: np.array([
+                                np.array(obs["object_pos"])[0],
+                                np.array(obs["object_pos"])[1],
+                                grasp_z,
+                            ]) - np.array([approach_dir[0], approach_dir[1], 0.0]) * SIDE_STANDOFF
+                            ) if grasp_orientation == "horizontal_bar" else
+                            np.array([cmd_approach_xy[0], cmd_approach_xy[1], grasp_z]),
+                            # Bar case: closed-loop standoff ALIGNED to the
+                            # object's CURRENT xy, so the subsequent slide_in
+                            # enters straight along the approach axis. A
+                            # diagonal entry from a stale standoff clips the
+                            # top weight's 5.5 cm overhang with a fingertip
+                            # edge and topples the dumbbell (~half of G1
+                            # attempts 6-7).
+                            target_quat, GRIP_OPEN,  0.005,   PHASE_MAX_STEPS),
         # Phase 4: closed-loop slide INWARD onto the disc rim. The disc is
         #          spawned in the narrow band where the Panda's natural
         #          horizontal-forward wrist pose places the gripper site,
@@ -1150,8 +1179,23 @@ def _side_grasp_phases(obs, env, objective, grasp_orientation):
             ("carry_mid",      np.array([(grasp_xy[0]+goal_eef_xy[0])*0.5,
                                           (grasp_xy[1]+goal_eef_xy[1])*0.5, carry_z]),        carry_quat,  GRIP_CLOSE, 0.03,    PHASE_MAX_STEPS, carry_pos_max),
             ("move_over",      np.array([goal_eef_xy[0], goal_eef_xy[1], carry_z]),           carry_quat,  GRIP_CLOSE, 0.02,    PHASE_MAX_STEPS, carry_pos_max),
+            # Let the hanging dumbbell's pendulum swing damp out before the
+            # descent — releasing with 1-2 cm of residual swing sets the
+            # bottom weight down half-off the shelf edge and it topples off
+            # (G1 attempt 12 shelf traces).
+            ("stabilize_over_goal", np.array([goal_eef_xy[0], goal_eef_xy[1], carry_z]),      carry_quat,  GRIP_CLOSE, None,    25, place_pos_max),
             ("descend_target", np.array([goal_eef_xy[0], goal_eef_xy[1], bar_drop_z]),        carry_quat,  GRIP_CLOSE, 0.01,    PHASE_MAX_STEPS * 2, place_pos_max),
+            # Seat the object: press it onto the support surface while still
+            # pinched, so it is at rest and load-bearing BEFORE the fingers
+            # open (drop objectives keep a free drop: no support to seat on).
+            *([] if objective == "trash_can" else [
+                ("seat_object", np.array([goal_eef_xy[0], goal_eef_xy[1], bar_drop_z - 0.015]), carry_quat, GRIP_CLOSE, None, 25, place_pos_max),
+            ]),
             ("open",           None,                                                          carry_quat,  GRIP_OPEN,  None,    HOLD_STEPS["open"]),
+            # Let the dropped dumbbell come to rest before the fingers move:
+            # withdrawing while it is still settling/leaning hooks the top
+            # weight and drags it back out (G1 attempt 6, trash_can ep00).
+            ("settle_release", None,                                                          carry_quat,  GRIP_OPEN,  None,    40),
             # Slide the open fingers back out from between the weights at the
             # release height; only then lift clear.
             ("retract_side",   np.array([retreat_xy[0], retreat_xy[1], bar_drop_z]),          carry_quat,  GRIP_OPEN,  0.02,    PHASE_MAX_STEPS, place_pos_max),
