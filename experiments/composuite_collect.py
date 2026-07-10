@@ -1165,6 +1165,19 @@ def _side_grasp_phases(obs, env, objective, grasp_orientation):
         # came in, and for trash_can the bottom weight must already be inside
         # the can mouth (below the rim) so the can wall stops the dumbbell
         # from following the fingers out.
+        #
+        # Shelf goals sample near the robot base (y ~ +0.21..0.27); reaching
+        # them with fingers pointing -y is the Panda's near-singular zone and
+        # the OSC stalls ~0.13 m short, seating the dumbbell on the board
+        # EDGE (G1 attempt 14). Yaw the place wrist to fingers +x for shelf —
+        # the pads grip a vertical cylinder, so yawing about the bar axis
+        # cannot lose the pinch.
+        if objective == "shelf":
+            place_quat_bar = _upright_bar_grasp_quat(np.array([1.0, 0.0]))
+            place_dir_bar = np.array([1.0, 0.0])
+        else:
+            place_quat_bar = carry_quat
+            place_dir_bar = approach_dir
         if objective == "trash_can":
             bar_drop_z = table_z + 0.22   # bottom weight ~1 cm below rim, captured by the mouth
         elif objective == "shelf":
@@ -1173,33 +1186,41 @@ def _side_grasp_phases(obs, env, objective, grasp_orientation):
             bar_drop_z = table_z + 0.09   # bottom weight ~1 cm above the tray floor
         else:
             bar_drop_z = drop_z
-        retreat_xy = goal_eef_xy - approach_dir * 0.15
+        retreat_xy = goal_eef_xy - place_dir_bar * 0.15
         return phases + [
-            ("lift",           np.array([grasp_xy[0], grasp_xy[1], carry_z]),                 carry_quat,  GRIP_CLOSE, 0.02,    PHASE_MAX_STEPS, carry_pos_max),
+            # Generous step budgets: the slow-capped carry covers up to ~0.5 m
+            # (shelf goals sample near the robot base); at PHASE_MAX_STEPS the
+            # traverse TIMES OUT mid-path and the placement happens wherever
+            # the arm got stuck (G1 attempt 13: every shelf drop ~0.2 m short
+            # of goal). Mirrors the plate path's y_traverse_steps = 8x.
+            ("lift",           np.array([grasp_xy[0], grasp_xy[1], carry_z]),                 carry_quat,  GRIP_CLOSE, 0.02,    PHASE_MAX_STEPS * 2, carry_pos_max),
+            # Yaw the wrist to the place orientation while holding position
+            # (no-op when place_quat_bar == carry_quat).
+            ("yaw_for_place",  np.array([grasp_xy[0], grasp_xy[1], carry_z]),                 place_quat_bar, GRIP_CLOSE, 0.02,  PHASE_MAX_STEPS, carry_pos_max),
             ("carry_mid",      np.array([(grasp_xy[0]+goal_eef_xy[0])*0.5,
-                                          (grasp_xy[1]+goal_eef_xy[1])*0.5, carry_z]),        carry_quat,  GRIP_CLOSE, 0.03,    PHASE_MAX_STEPS, carry_pos_max),
-            ("move_over",      np.array([goal_eef_xy[0], goal_eef_xy[1], carry_z]),           carry_quat,  GRIP_CLOSE, 0.02,    PHASE_MAX_STEPS, carry_pos_max),
+                                          (grasp_xy[1]+goal_eef_xy[1])*0.5, carry_z]),        place_quat_bar, GRIP_CLOSE, 0.03,  PHASE_MAX_STEPS * 4, carry_pos_max),
+            ("move_over",      np.array([goal_eef_xy[0], goal_eef_xy[1], carry_z]),           place_quat_bar, GRIP_CLOSE, 0.02,  PHASE_MAX_STEPS * 4, carry_pos_max),
             # Let the hanging dumbbell's pendulum swing damp out before the
             # descent — releasing with 1-2 cm of residual swing sets the
             # bottom weight down half-off the shelf edge and it topples off
             # (G1 attempt 12 shelf traces).
-            ("stabilize_over_goal", np.array([goal_eef_xy[0], goal_eef_xy[1], carry_z]),      carry_quat,  GRIP_CLOSE, None,    25, place_pos_max),
-            ("descend_target", np.array([goal_eef_xy[0], goal_eef_xy[1], bar_drop_z]),        carry_quat,  GRIP_CLOSE, 0.01,    PHASE_MAX_STEPS * 2, place_pos_max),
+            ("stabilize_over_goal", np.array([goal_eef_xy[0], goal_eef_xy[1], carry_z]),      place_quat_bar, GRIP_CLOSE, None,  25, place_pos_max),
+            ("descend_target", np.array([goal_eef_xy[0], goal_eef_xy[1], bar_drop_z]),        place_quat_bar, GRIP_CLOSE, 0.01,  PHASE_MAX_STEPS * 2, place_pos_max),
             # Seat the object: press it onto the support surface while still
             # pinched, so it is at rest and load-bearing BEFORE the fingers
             # open (drop objectives keep a free drop: no support to seat on).
             *([] if objective == "trash_can" else [
-                ("seat_object", np.array([goal_eef_xy[0], goal_eef_xy[1], bar_drop_z - 0.015]), carry_quat, GRIP_CLOSE, None, 25, place_pos_max),
+                ("seat_object", np.array([goal_eef_xy[0], goal_eef_xy[1], bar_drop_z - 0.015]), place_quat_bar, GRIP_CLOSE, None, 25, place_pos_max),
             ]),
-            ("open",           None,                                                          carry_quat,  GRIP_OPEN,  None,    HOLD_STEPS["open"]),
+            ("open",           None,                                                          place_quat_bar, GRIP_OPEN,  None,  HOLD_STEPS["open"]),
             # Let the dropped dumbbell come to rest before the fingers move:
             # withdrawing while it is still settling/leaning hooks the top
             # weight and drags it back out (G1 attempt 6, trash_can ep00).
-            ("settle_release", None,                                                          carry_quat,  GRIP_OPEN,  None,    40),
+            ("settle_release", None,                                                          place_quat_bar, GRIP_OPEN,  None,  40),
             # Slide the open fingers back out from between the weights at the
             # release height; only then lift clear.
-            ("retract_side",   np.array([retreat_xy[0], retreat_xy[1], bar_drop_z]),          carry_quat,  GRIP_OPEN,  0.02,    PHASE_MAX_STEPS, place_pos_max),
-            ("retract",        np.array([retreat_xy[0], retreat_xy[1], carry_z + 0.05]),      carry_quat,  GRIP_OPEN,  0.03,    PHASE_MAX_STEPS),
+            ("retract_side",   np.array([retreat_xy[0], retreat_xy[1], bar_drop_z]),          place_quat_bar, GRIP_OPEN,  0.02,  PHASE_MAX_STEPS, place_pos_max),
+            ("retract",        np.array([retreat_xy[0], retreat_xy[1], carry_z + 0.05]),      place_quat_bar, GRIP_OPEN,  0.03,  PHASE_MAX_STEPS),
         ]
     return phases + [
         # Slide the disc OFF the shelf horizontally before lifting. The disc

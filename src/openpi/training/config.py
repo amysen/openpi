@@ -1343,7 +1343,7 @@ _CONFIGS = [
         )
         for tag, repo in [
             ("plate", "composuite_plate_protocol"),
-            ("dumbbell_shelf", "composuite_dumbbell_shelf_protocol"),
+            ("dumbbell_pp", "composuite_dumbbell_pp_protocol"),
             ("box_shelf", "composuite_box_shelf_protocol"),
         ]
     ],
