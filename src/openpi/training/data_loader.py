@@ -340,27 +340,22 @@ def create_torch_data_loader(
     else:
         local_batch_size = batch_size // jax.process_count()
 
-    # Optional phase-weighted sampler. Skipped under DDP (DistributedSampler already set)
-    # and under fake/RLDS data. Replaces uniform shuffling with motion-magnitude
-    # weighting so grasp/place frames are not drowned out by long approach phases.
-    if (
+    # Optional weighted sampler: phase weighting (motion-magnitude upweighting so
+    # grasp/place frames are not drowned out by long approach phases) and/or
+    # per-source mix weighting (realize an exact expected mix fraction between the
+    # new-task and mix-source episodes of a combined repo, independent of episode
+    # counts). Skipped under DDP (DistributedSampler already set) and fake/RLDS data.
+    weighting_ok = (
         sampler is None
-        and data_config.phase_weighted_sampling
         and data_config.repo_id not in (None, "fake")
         and data_config.rlds_data_dir is None
-    ):
+    )
+    weights = None
+    if weighting_ok and data_config.phase_weighted_sampling:
         weights = _build_phase_weights(
             dataset,
             baseline=data_config.phase_weight_baseline,
             alpha=data_config.phase_weight_alpha,
-        )
-        generator = torch.Generator()
-        generator.manual_seed(int(seed))
-        sampler = torch.utils.data.WeightedRandomSampler(
-            weights=weights,
-            num_samples=len(weights),
-            replacement=True,
-            generator=generator,
         )
         logging.info(
             "phase_weighted_sampling: enabled (baseline=%.3f, alpha=%.3f, n=%d, "
@@ -371,6 +366,22 @@ def create_torch_data_loader(
             float(weights.min()),
             float(weights.mean()),
             float(weights.max()),
+        )
+    if weighting_ok and data_config.mix_fraction is not None:
+        weights = _build_mix_weights(
+            dataset,
+            keywords=tuple(data_config.mix_task_keywords),
+            fraction=float(data_config.mix_fraction),
+            base_weights=weights,
+        )
+    if weights is not None:
+        generator = torch.Generator()
+        generator.manual_seed(int(seed))
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights=weights,
+            num_samples=len(weights),
+            replacement=True,
+            generator=generator,
         )
 
     logging.info(f"local_batch_size: {local_batch_size}")
@@ -420,6 +431,62 @@ def _build_phase_weights(dataset, *, baseline: float, alpha: float) -> torch.Ten
         scale = float(norms.max()) or 1.0
     weights = baseline + alpha * np.minimum(1.0, norms / scale)
     return torch.as_tensor(weights, dtype=torch.double)
+
+
+def _build_mix_weights(
+    dataset, *, keywords, fraction: float, base_weights: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Per-frame weights realizing an expected per-source mix fraction.
+
+    Frames whose LeRobot task string contains any of `keywords` form the MIX
+    source; the rest are the NEW-task source. Each group's total weight is
+    scaled to `fraction` / `1 - fraction`, so a batch contains the MIX source
+    with expected fraction `fraction` regardless of the groups' episode counts.
+    Within a group, relative weights follow `base_weights` (e.g. phase weights)
+    or are uniform when base_weights is None.
+    """
+    if not 0.0 < fraction < 1.0:
+        raise ValueError(f"mix_fraction must be in (0, 1), got {fraction}")
+    if not keywords:
+        raise ValueError("mix_task_keywords must be non-empty when mix_fraction is set")
+    base = dataset
+    while hasattr(base, "_dataset"):
+        base = base._dataset
+    hf_dataset = getattr(base, "hf_dataset", None)
+    meta = getattr(base, "meta", None)
+    if hf_dataset is None or meta is None:
+        raise RuntimeError(
+            "mix_fraction requires the dataset to expose an underlying "
+            "LeRobotDataset with `hf_dataset` and `meta` attributes."
+        )
+    task_of = {int(k): str(v) for k, v in meta.tasks.items()}
+    task_idx = np.asarray(hf_dataset["task_index"]).reshape(-1)
+    idx_is_mix = {
+        i: any(k in t for k in keywords) for i, t in task_of.items()
+    }
+    is_mix = np.array([idx_is_mix[int(i)] for i in task_idx], dtype=bool)
+    n_mix = int(is_mix.sum())
+    n_new = int((~is_mix).sum())
+    if n_mix == 0 or n_new == 0:
+        raise RuntimeError(
+            f"mix_fraction set but the repo splits into mix={n_mix} / new={n_new} "
+            f"frames for keywords={keywords} — check mix_task_keywords against the "
+            f"dataset's task strings: {sorted(set(task_of.values()))[:8]}"
+        )
+    w = (
+        np.ones(len(is_mix), dtype=np.float64)
+        if base_weights is None
+        else np.asarray(base_weights, dtype=np.float64)
+    )
+    out = np.empty_like(w)
+    out[is_mix] = w[is_mix] * (fraction / w[is_mix].sum())
+    out[~is_mix] = w[~is_mix] * ((1.0 - fraction) / w[~is_mix].sum())
+    logging.info(
+        "mix_fraction sampling: enabled (fraction=%.2f, keywords=%s, "
+        "mix frames=%d, new frames=%d, raw frame share of mix=%.3f)",
+        fraction, list(keywords), n_mix, n_new, n_mix / len(is_mix),
+    )
+    return torch.as_tensor(out, dtype=torch.double)
 
 
 def create_rlds_data_loader(

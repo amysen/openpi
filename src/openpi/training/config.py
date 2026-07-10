@@ -91,6 +91,17 @@ class DataConfig:
     # Multiplier on the normalized action magnitude component of the weight.
     phase_weight_alpha: float = 1.0
 
+    # Per-source mix sampling for co-training-mixture experiments. When
+    # mix_fraction is set, frames whose LeRobot task string contains any of
+    # mix_task_keywords form the MIX source and are sampled with expected
+    # fraction mix_fraction; all other frames get the remaining 1-mix_fraction.
+    # Decouples the mix ratio from episode counts in the combined repo (30 mix
+    # demos can be sampled at 50%) and composes with phase_weighted_sampling.
+    # Same constraints as phase weighting (non-RLDS LeRobot, no DDP). See
+    # `_build_mix_weights` in data_loader.py.
+    mix_fraction: float | None = None
+    mix_task_keywords: Sequence[str] = ()
+
     # Names of keys that will be used by the data loader to generate the action sequence. The length of the
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
     # LeRobot dataset is using different keys to represent the action.
@@ -302,6 +313,9 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
     phase_weighted_sampling: bool = False
     phase_weight_baseline: float = 0.2
     phase_weight_alpha: float = 1.0
+    # Per-source mix sampling (see DataConfig.mix_fraction / mix_task_keywords).
+    mix_fraction: float | None = None
+    mix_task_keywords: Sequence[str] = ()
     # Train-time augmentation. Applied inside the repack group, so it runs during
     # dataset iteration (training + compute_norm_stats) but NOT during inference.
     # Goal: robustify BC against closed-loop covariate shift by perturbing the
@@ -387,6 +401,8 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             phase_weighted_sampling=self.phase_weighted_sampling,
             phase_weight_baseline=self.phase_weight_baseline,
             phase_weight_alpha=self.phase_weight_alpha,
+            mix_fraction=self.mix_fraction,
+            mix_task_keywords=tuple(self.mix_task_keywords),
         )
 
 @dataclasses.dataclass(frozen=True)
