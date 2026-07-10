@@ -367,12 +367,29 @@ def main():
     logging.info(f"object={args.object_type}  objective={args.objective}  prompt={args.prompt!r}")
 
     results = []
-    for i, seed_i in enumerate(seed_list):
+    # A rare seed can make the env's target-spawn rejection sampler fail at
+    # reset (composuite_env._reset_internal RuntimeError). Skip such seeds --
+    # they are invalid layouts, not policy failures -- and draw replacements
+    # so the number of VALID trials still reaches len(seed_list).
+    seeds_pending = list(seed_list)
+    next_extra_seed = max(seed_list) + 1
+    reset_failed_seeds = []
+    i = -1
+    while seeds_pending:
+        seed_i = seeds_pending.pop(0)
+        i += 1
         t0 = time.time()
-        success, steps, frames, diag = _run_trial(
-            env, policy, args.max_steps, args.replan_steps, seed_i, prompt=args.prompt,
-            end_on_release=args.end_on_release, obs_convention=args.obs_convention,
-        )
+        try:
+            success, steps, frames, diag = _run_trial(
+                env, policy, args.max_steps, args.replan_steps, seed_i, prompt=args.prompt,
+                end_on_release=args.end_on_release, obs_convention=args.obs_convention,
+            )
+        except RuntimeError as e:
+            logging.warning(f"  trial {i:02d}: seed {seed_i} invalid layout, replacing ({e})")
+            reset_failed_seeds.append(seed_i)
+            seeds_pending.append(next_extra_seed)
+            next_extra_seed += 1
+            continue
         # For trash_can, the env's predicate fires while the plate is still held at
         # the opening (lenient + transient). Require the SETTLED plate to actually be
         # INSIDE the can: within the can footprint (xy) and dropped below the rim. Pair
@@ -410,6 +427,7 @@ def main():
         "step": step_tag,
         "num_trials": len(results),
         "success_rate": float(np.mean([r["success"] for r in results])) if results else 0.0,
+        "reset_failed_seeds": reset_failed_seeds,
         "trials": results,
     }
     with open(out / f"step_{step_tag}_eval.json", "w") as f:
