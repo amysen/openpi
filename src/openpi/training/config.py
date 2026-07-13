@@ -1347,6 +1347,69 @@ _CONFIGS = [
             ("box_shelf", "composuite_box_shelf_protocol"),
         ]
     ],
+    # Block B: overlap x norm-stats factorial. Combined repos hold N + mix
+    # episodes; the per-source sampler realizes mix_fraction=0.2 in
+    # expectation via mix_task_keywords (substrings unique to the MIX
+    # source's task strings). Norm-stats arms: "u" computes union stats over
+    # the combined repo; "n" copies the Block A new-task-only stats into this
+    # config's asset dir (same mechanism as the papermatch pilot).
+    *[
+        TrainConfig(
+            name=f"pi05_libero_{tag}",
+            model=pi0_config.Pi0Config(
+                pi05=True,
+                action_horizon=10,
+                discrete_state_input=False,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ),
+            data=LeRobotLiberoDataConfig(
+                repo_id=repo,
+                assets=AssetsConfig(asset_id=repo),
+                base_config=DataConfig(prompt_from_task=True),
+                extra_delta_transform=False,
+                mix_fraction=0.2,
+                mix_task_keywords=keywords,
+            ),
+            batch_size=32,
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=300,
+                peak_lr=5e-5,
+                decay_steps=10_000,
+                decay_lr=5e-6,
+            ),
+            optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+            ema_decay=0.998,
+            freeze_filter=pi0_config.Pi0Config(
+                pi05=True,
+                action_horizon=10,
+                discrete_state_input=False,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ).get_freeze_filter(),
+            weight_loader=weight_loaders.CheckpointWeightLoader(
+                "gs://openpi-assets/checkpoints/pi05_libero/params"
+            ),
+            num_train_steps=10_000,
+            save_interval=2_000,
+            log_interval=10,
+            keep_period=None,
+            specific_checkpoints_to_keep=[],
+            save_train_state=False,
+            wandb_enabled=True,
+            checkpoint_base_dir="/home/pajak/compositional-learning-vla/results/checkpoints",
+            assets_base_dir="/home/pajak/compositional-learning-vla/results/assets",
+        )
+        for base_tag, repo, keywords in [
+            ("B_dpp_sobj", "composuite_B_dpp_dshelf", ("on the shelf",)),
+            ("B_dpp_sobjv", "composuite_B_dpp_bpp", ("box",)),
+            ("B_dpp_disj", "composuite_B_dpp_btc", ("box",)),
+            ("B_bshelf_sobj", "composuite_B_bshelf_btc", ("trash",)),
+            ("B_bshelf_sobjv", "composuite_B_bshelf_dshelf", ("dumbbell",)),
+            ("B_bshelf_disj", "composuite_B_bshelf_dpp", ("dumbbell",)),
+        ]
+        for tag in (f"{base_tag}_u", f"{base_tag}_n")
+    ],
     # Phase B (sequential continuation, per Zhu et al. 2026). Init from the PLATE-COMPETENT
     # plate-only 10k checkpoint (= Phase A: the side-grasp wrist primitive already formed --
     # 90% side-grasp, 75% carry), then GENTLY recover box via replay while rehearsing plate.
